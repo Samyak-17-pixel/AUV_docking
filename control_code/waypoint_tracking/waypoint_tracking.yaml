@@ -1,0 +1,87 @@
+# Waypoint tracker — all tunable parameters live here.
+# Frame: NED (x forward North, y East, z positive down).
+# Actuator commands are ESC/servo PWM (µs).
+
+node:
+  name: waypoint_tracking
+  rate_hz: 20.0
+  ros_domain_id: 42
+
+topics:
+  odometry: /Mako_01/odometry_sim          # nav_msgs/Odometry
+  actuator_cmd: /Mako_01/actuator_cmd      # interfaces/Actuator
+  vessel_state: ""                         # e.g. /Mako_01/vessel_state
+
+actuators:
+  names:
+    - th_02   # Heave_thruster_1 (forward)
+    - th_03   # Heave_thruster_2 (aft)
+    - th_01   # Axial_thruster (surge)
+    - cs_04
+    - cs_06
+    - cs_07
+    - cs_08
+  heave_fwd: th_02
+  heave_aft: th_03
+  surge: th_01
+  fins:
+    - cs_04
+    - cs_06
+    - cs_07
+    - cs_08
+  # X-fin yaw mix signs (one per fin, same order as fins above)
+  fin_yaw_signs: [1.0, 1.0, -1.0, -1.0]
+
+# ESC / servo PWM (µs). Stop = neutral. Commands are soft-capped.
+pwm:
+  min: 1100.0
+  max: 1900.0
+  neutral: 1500.0
+  cap_min: 1200.0
+  cap_max: 1800.0
+
+waypoints:
+  - {x: 10.0, y: 0.0, z: 5.0}
+  - {x: 20.0, y: 10.0, z: 5.0}
+  - {x: 0.0, y: 10.0, z: 3.0}
+  - {x: 0.0, y: 0.0, z: 3.0}
+
+mission:
+  acceptance_radius_m: 0.5
+  depth_acceptance_m: 0.25
+  hold_depth_m: 5.0
+  loop: false
+  wait_for_odometry: true
+  zero_on_exit: true
+
+heading:
+  # Output is signed PWM delta from neutral [µs]
+  kp: 8.0                 # µs per deg heading error
+  ki: 0.4
+  kd: 2.0
+  i_max: 80.0             # integral clamp [µs]
+  d_filter_tau_s: 0.05
+  max_fin_delta_us: 200.0 # |fin PWM - neutral| max before soft cap
+  align_deg: 25.0
+
+surge:
+  # Absolute PWM when heading is aligned
+  cruise_pwm: 1600.0
+  scale_with_heading: true
+  creep_pwm: 1500.0
+  pwm_min: 1500.0
+  pwm_max: 1800.0
+
+depth_pid:
+  # Output is signed PWM delta from neutral [µs]
+  kp: 80.0
+  ki: 8.0
+  kd: 40.0
+  i_max: 200.0
+  d_filter_tau_s: 0.05
+
+limits:
+  heave_sign: 1.0          # flip if PWM > neutral surfaces
+
+logging:
+  status_period_s: 2.0

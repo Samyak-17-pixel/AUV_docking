@@ -1,0 +1,71 @@
+# Depth PID controller — all tunable parameters live here.
+# Frame: NED (z positive down). Positive heave effort → PWM > neutral (dive).
+
+node:
+  name: depth_control
+  rate_hz: 20.0
+  # Match mavsim bridge (default 42). Override with env ROS_DOMAIN_ID if set.
+  ros_domain_id: 42
+
+topics:
+  odometry: /Mako_01/odometry_sim          # nav_msgs/Odometry
+  actuator_cmd: /Mako_01/actuator_cmd      # interfaces/Actuator
+
+actuators:
+  # Names must match vessel config (th_XX / cs_XX).
+  names:
+    - th_02   # Heave_thruster_1 (forward)
+    - th_03   # Heave_thruster_2 (aft)
+    - th_01   # Axial_thruster (surge)
+    - cs_04
+    - cs_06
+    - cs_07
+    - cs_08
+  heave_fwd: th_02
+  heave_aft: th_03
+  surge: th_01
+  fins:
+    - cs_04
+    - cs_06
+    - cs_07
+    - cs_08
+
+# ESC / servo PWM (µs). Stop = neutral. Commands are soft-capped.
+pwm:
+  min: 1100.0
+  max: 1900.0
+  neutral: 1500.0
+  # Soft command limits (must lie within min/max)
+  cap_min: 1200.0
+  cap_max: 1800.0
+
+depth:
+  # Desired absolute NED depth [m] (positive = deeper).
+  setpoint_m: 5.0
+
+pid:
+  # Output is signed PWM delta from neutral [µs]
+  kp: 80.0          # µs per metre of depth error
+  ki: 8.0           # µs per (m·s) integrated error
+  kd: 40.0          # µs per (m/s) depth-rate error
+  i_max: 200.0      # integral clamp [µs]
+  d_filter_tau_s: 0.05
+
+limits:
+  # Hold surge / fins at neutral while depth controlling
+  surge_pwm: 1500.0
+  fin_pwm: 1500.0
+  # Flip if PWM > neutral surfaces instead of diving
+  heave_sign: 1.0
+
+behaviour:
+  # Within this band counts as "at depth" [m]
+  settle_tolerance_m: 0.2
+  # Hold with PID for this long once inside the band, then neutral and exit [s]
+  settle_time_s: 30.0
+  wait_for_odometry: true
+  # Publish neutral PWM on shutdown / Ctrl-C
+  zero_on_exit: true
+
+logging:
+  status_period_s: 2.0

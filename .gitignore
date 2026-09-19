@@ -1,0 +1,15 @@
+# Ignore sibling folders not being pushed yet
+custom_auv/
+Papers/
+
+# Gate detection lives locally only (not pushed to GitHub with this repo)
+Gate-Detection/
+
+# ROS 2 / colcon build artifacts inside control_code
+control_code/ws/build/
+control_code/ws/install/
+control_code/ws/log/
+**/__pycache__/
+*.pyc
+*.pyo
+.DS_Store
