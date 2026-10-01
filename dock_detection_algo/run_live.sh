@@ -6,7 +6,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 WS="$(cd "${ROOT}/../control_code/ws" && pwd)"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-TOPIC="${TOPIC:-/Mako_01/camera_03/image/compressed}"
+TOPIC="${TOPIC:-}"          # empty -> use camera.topic from the YAML
+CONFIG="${CONFIG:-${ROOT}/dock_detection.yaml}"
 
 # Docker bridge ↔ host: disable Fast-DDS shared memory or images never arrive.
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
@@ -23,7 +24,8 @@ set -u
 
 ALIGN_TOPIC="${ALIGN_TOPIC:-}"
 echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
-echo "TOPIC=${TOPIC}"
+echo "TOPIC=${TOPIC:-<from YAML>}"
+echo "CONFIG=${CONFIG}"
 echo "DISPLAY=${DISPLAY:-<unset>}"
 echo "FASTRTPS_DEFAULT_PROFILES_FILE=${FASTRTPS_DEFAULT_PROFILES_FILE}"
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -33,8 +35,7 @@ fi
 echo "Tips: echo DockAlign with: ./echo_align.sh"
 
 cd "${ROOT}"
-if [[ -n "${ALIGN_TOPIC}" ]]; then
-  exec python3 "${ROOT}/live_dock_lights.py" --topic "${TOPIC}" --align-topic "${ALIGN_TOPIC}" "$@"
-else
-  exec python3 "${ROOT}/live_dock_lights.py" --topic "${TOPIC}" "$@"
-fi
+ARGS=(--config "${CONFIG}")
+[[ -n "${TOPIC}" ]] && ARGS+=(--topic "${TOPIC}")
+[[ -n "${ALIGN_TOPIC}" ]] && ARGS+=(--align-topic "${ALIGN_TOPIC}")
+exec python3 "${ROOT}/live_dock_lights.py" "${ARGS[@]}" "$@"

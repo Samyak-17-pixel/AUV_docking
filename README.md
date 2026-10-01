@@ -4,7 +4,7 @@ ROS 2 software for **autonomous underwater vehicle (AUV) docking** in the **mavs
 
 The vehicle (**Mako_01**) approaches a **funnel dock** marked by **four lights**. This repository covers:
 
-1. **Motion control** — depth hold and waypoint tracking via actuator PWM on `/Mako_01/actuator_cmd`
+1. **Motion control** — depth hold, waypoint tracking, per-DOF testing and station keeping via actuator commands (thruster RPM / fin degrees) on `/Mako_01/actuator_cmd`
 2. **Dock perception** — detect the four lights, estimate dock center, publish alignment errors
 3. **Gate detection (reference, local only)** — classical CV for SAUVC-style gates may exist as a local `Gate-Detection/` folder on disk; it is **gitignored and not published** to this GitHub repo. Dock light perception in `dock_detection_algo/` is inspired by that classical-mask approach but uses brightness peaks instead of vertical poles.
 
@@ -21,7 +21,7 @@ Primary stack: **ROS 2 Humble**, **OpenCV**, **Python**, talking to a running **
 5. [`dock_detection_algo/` — funnel-dock perception](#5-dock_detection_algo--funnel-dock-perception)
 6. [`Gate-Detection/` — SAUVC gate CV reference](#6-gate-detection--sauvc-gate-cv-reference)
 7. [ROS topics and messages](#7-ros-topics-and-messages)
-8. [Conventions (NED, PWM, alignment signs)](#8-conventions-ned-pwm-alignment-signs)
+8. [Conventions (NED, units, alignment signs)](#8-conventions-ned-units-alignment-signs)
 9. [Quick start recipes](#9-quick-start-recipes)
 10. [Docker / DDS note (important)](#10-docker--dds-note-important)
 11. [Suggested end-to-end docking flow](#11-suggested-end-to-end-docking-flow)
@@ -42,11 +42,11 @@ Primary stack: **ROS 2 Humble**, **OpenCV**, **Python**, talking to a running **
 
 | Folder | Role |
 |--------|------|
-| `control_code/` | Controllers that **subscribe to state** and **publish actuator PWM** |
+| `control_code/` | Controllers that **subscribe to state** and **publish actuator commands (thruster RPM, fin degrees)** |
 | `dock_detection_algo/` | Vision that **subscribes to camera**, shows masks/geometry, **publishes `/…/dock_align`** |
 | `Gate-Detection/` | Optional **local-only** gate-pole detector (gitignored; not on GitHub) |
 
-Perception (`dock_align`) and control (`actuator_cmd`) are currently **separate nodes**. A future docking controller would subscribe to `DockAlign` and write PWM commands.
+Perception (`dock_align`) and control (`actuator_cmd`) are currently **separate nodes**. A future docking controller would subscribe to `DockAlign` and write actuator commands.
 
 ---
 
@@ -58,6 +58,11 @@ Docking/
 ├── LICENSE                   ← MIT (Samyak, 2026)
 ├── .gitignore
 ├── control_code/             ← depth + waypoint control + ROS interfaces package
+│   ├── common/               ← shared allocation (thrusters + X-fins), PID, hold loops, vehicle geometry
+│   ├── dof_testing/          ← per-DOF open-loop step + closed-loop hold tests
+│   ├── station_keeping/      ← hover hold (depth, pitch, surge, heading)
+│   ├── sim_offline/          ← simple 6-DOF fake vehicle (no mavsim needed)
+│   ├── tests/                ← pytest suite
 │   ├── depth_control/
 │   ├── waypoint_tracking/
 │   └── ws/                   ← colcon workspace (interfaces msgs)
@@ -115,12 +120,12 @@ Ignores local colcon `ws/build`, `ws/install`, `ws/log`, and Python bytecode so 
 
 ### 4.2 `depth_control/` — closed-loop depth PID
 
-**Goal:** Drive the AUV to an **absolute NED depth** from YAML, hold within a tolerance for a configured settle time using a PID on the **heave thrusters**, then command **neutral PWM** and exit.
+**Goal:** Drive the AUV to an **absolute NED depth** from YAML, hold within a tolerance for a configured settle time using a PID on the **heave thrusters**, then command **zero** and exit.
 
 | File | Purpose |
 |------|---------|
-| **`depth_control.py`** | ROS 2 node. Subscribes to `/Mako_01/odometry_sim` (`nav_msgs/Odometry`), runs a PID on depth error `setpoint − z`, maps signed effort to heave PWM around neutral (1500), publishes `interfaces/Actuator` on `/Mako_01/actuator_cmd`. Surge and fins stay at neutral. On settle or shutdown, publishes neutral and exits. |
-| **`depth_control.yaml`** | All tunables: rate, topics, actuator names (`th_02`/`th_03` heave, `th_01` surge, `cs_*` fins), PWM range/caps/neutral, depth `setpoint_m`, PID gains, settle tolerance/time, logging. |
+| **`depth_control.py`** | ROS 2 node. Subscribes to `/Mako_01/odometry_sim` (`nav_msgs/Odometry`), runs a PID on depth error `setpoint − z`, maps signed effort to a heave thruster RPM (soft-capped; `heave_sign = -1` because the heave thrusters point UP), publishes `interfaces/Actuator` on `/Mako_01/actuator_cmd`. Surge and fins stay at neutral. On settle or shutdown, publishes neutral and exits. |
+| **`depth_control.yaml`** | All tunables: rate, topics, actuator names (`th_02`/`th_03` heave, `th_01` surge, `cs_*` fins), RPM/fin-degree limits, depth `setpoint_m`, PID gains, settle tolerance/time, logging. |
 | **`run_depth_control.sh`** | One-shot launcher: sets `ROS_DOMAIN_ID` (default 42), sources Humble + `control_code/ws/install`, runs `depth_control.py` with the YAML beside it. |
 
 **Typical run:**
@@ -134,12 +139,12 @@ cd ~/Docking/control_code/depth_control
 
 ### 4.3 `waypoint_tracking/` — multi-waypoint guidance
 
-**Goal:** Follow a list of NED waypoints with combined **heading (fins)**, **surge**, and **depth (heave)** control, all in PWM.
+**Goal:** Follow a list of NED waypoints with combined **heading (fins)**, **surge**, and **depth (heave)** control, all as thruster RPM / fin degrees.
 
 | File | Purpose |
 |------|---------|
-| **`waypoint_tracking.py`** | ROS 2 node. Subscribes to odometry; for the current waypoint computes heading error → fin PWM mix, surge PWM when aligned, depth PID → heave PWM. Advances when inside XY radius and depth band. Publishes `Actuator` on the configured topic. Zeros/neutral on mission complete or exit. |
-| **`waypoint_tracking.yaml`** | Waypoint list, acceptance radii, PWM block, heading/surge/depth PID gains, fin mix signs, actuator IDs, logging. |
+| **`waypoint_tracking.py`** | ROS 2 node. Subscribes to odometry; for the current waypoint computes heading error → fin yaw mix (deg), surge RPM when aligned, depth PID → heave RPM. Advances when inside XY radius and depth band. Publishes `Actuator` on the configured topic. Zeros/neutral on mission complete or exit. |
+| **`waypoint_tracking.yaml`** | Waypoint list, acceptance radii, RPM/degree limits, heading/surge/depth PID gains, fin mix signs, actuator IDs, logging. |
 | **`run_waypoint_tracking.sh`** | Sources ROS + interfaces workspace and runs the tracker with its YAML. |
 
 **Typical run:**
@@ -173,7 +178,7 @@ source ~/Docking/control_code/ws/install/setup.bash
 
 | Message | Purpose |
 |---------|---------|
-| **`Actuator.msg`** | Actuator command / state: `header`, `actuator_values[]`, `actuator_names[]`, `covariance[]`. Controllers fill names like `th_02`, `cs_04` with PWM (or historically RPM/deg in mavsim docs). Bridge maps by **name**. |
+| **`Actuator.msg`** | Actuator command / state: `header`, `actuator_values[]`, `actuator_names[]`, `covariance[]`. Controllers fill names like `th_02`, `cs_04` with RPM (`th_XX`) or degrees (`cs_XX`). Bridge maps by **name**. |
 | **`DVL.msg`** | DVL body-frame velocity + covariance (for consumers of DVL; not used by the current depth/waypoint nodes). |
 | **`WaveProbe.msg`** | Wave surface elevation at a world point (mavsim sensor; not used by current controllers). |
 | **`DockAlign.msg`** | Dock-centering guidance published by `dock_detection_algo`: validity, pixel/normalized errors, radius/spread, T/B/L/R points, confidence, status. See §7. |
@@ -186,6 +191,17 @@ source /opt/ros/humble/setup.bash
 colcon build --packages-select interfaces
 source install/setup.bash
 ```
+
+### 4.5 `common/`, `dof_testing/`, `station_keeping/`, `sim_offline/`
+
+See `CLAUDE.md` for the full description and `execution.md` for the commands.
+
+| Folder | Purpose |
+|--------|---------|
+| `common/` | `allocation.py` (wrench → thruster RPM + X-fin degrees; fins gain-scheduled on speed²), `pid.py`, `loops.py` (single-axis hold loops), `state.py`, `mako_geometry.yaml` (vehicle data extracted from `Mako_01.mavsim`, with every assumption flagged). |
+| `dof_testing/` | `./run_dof_testing.sh --dof surge\|heave\|pitch\|yaw\|roll\|sway --mode step\|hold`. `step` verifies allocation/signs (PASS/FAIL), `hold` verifies/tunes the PID. Tunables: `dof_testing.yaml`. |
+| `station_keeping/` | `./run_station_keeping.sh`. Hover: holds depth + pitch (heave thrusters), surge position (axial thruster) and heading (fins, only with flow). Sway cannot be held (no actuator). Tunables with effect/analogy notes: `station_keeping.yaml`. |
+| `sim_offline/` | `fake_vehicle.py` publishes `/Mako_01/odometry_sim` from `/Mako_01/actuator_cmd` using a simple model built from the vessel config. Catches sign and gain-structure bugs only; not the real sim. |
 
 ---
 
@@ -353,21 +369,22 @@ Always match **`ROS_DOMAIN_ID`** to the bridge (default **42**).
 
 ---
 
-## 8. Conventions (NED, PWM, alignment signs)
+## 8. Conventions (NED, units, alignment signs)
 
 ### NED (mavsim / odometry)
 
 - **z positive down**
 - Depth setpoint in YAML is absolute NED depth in metres
 
-### Actuator PWM (this repo’s controllers)
+### Actuator units and signs (this repo's controllers)
 
 | | |
 |--|--|
-| Hardware range | 1100–1900 µs |
-| Neutral / stop | **1500** |
-| Soft command cap | **1200–1800** |
-| Heave dive (default) | PWM **above** neutral (unless `heave_sign` flipped) |
+| Thrusters `th_XX` | **RPM**, hardware ±2668, soft cap in each YAML (`rpm_cap`) |
+| Fins `cs_XX` | **degrees**, hardware ±35, soft cap `fin_deg_cap` |
+| Stop / centred | **0** |
+| Heave thrusters (`th_02`, `th_03`) | point **UP** (config orientation pitch = +90°): **positive RPM = up, dive = NEGATIVE RPM** (`heave_sign: -1`) |
+| Wrench convention | `[X, Y, Z, K, M, N]`, body frame, **Z positive down**, M positive nose-up, N positive bow-to-starboard |
 
 Actuator **names** must match the vessel config (`th_01`, `th_02`, `th_03`, `cs_04`, …). Empty `actuator_names` are ignored by the bridge.
 
@@ -453,7 +470,7 @@ Also: the simulation session must be **running / not paused**, or odometry stays
    - if `!valid` → search / hold
    - drive lateral/vertical from `error_x_*` / `error_y_*`
    - use `aligned` / `spread_px` before closing distance
-   - publish PWM on `/Mako_01/actuator_cmd`
+   - publish actuator commands on `/Mako_01/actuator_cmd`
 5. **Waypoint tracking** remains available for transit legs before the visual docking phase.
 
 ---

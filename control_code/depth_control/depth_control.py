@@ -2,10 +2,11 @@
 """Closed-loop depth PID for mavsim Mako (ROS 2).
 
 Reads absolute NED depth setpoint from depth_control.yaml, drives heave
-thrusters with a PID in ESC PWM (µs), holds within tolerance for
-settle_time_s, then commands neutral and exits.
+thrusters with a PID in RPM, holds within tolerance for
+settle_time_s, then commands zero and exits.
 
-PWM: 1100–1900, neutral 1500, soft-capped to 1200–1800.
+Units sent to the sim (via the bridge, unmodified): th_XX = RPM, cs_XX = degrees.
+Zero = stop / centred fins. Commands are soft-capped by the YAML limits.
 
   export ROS_DOMAIN_ID=42
   source /opt/ros/humble/setup.bash
@@ -100,22 +101,15 @@ class DepthControl(Node):
         self.behaviour = cfg.get("behaviour", {})
         self.logging_cfg = cfg.get("logging", {})
 
-        pwm = cfg["pwm"]
-        self.pwm_min = float(pwm["min"])
-        self.pwm_max = float(pwm["max"])
-        self.pwm_neutral = float(pwm["neutral"])
-        self.pwm_cap_min = float(pwm["cap_min"])
-        self.pwm_cap_max = float(pwm["cap_max"])
-        if not (
-            self.pwm_min
-            <= self.pwm_cap_min
-            <= self.pwm_neutral
-            <= self.pwm_cap_max
-            <= self.pwm_max
-        ):
-            raise ValueError(
-                "pwm: require min <= cap_min <= neutral <= cap_max <= max"
-            )
+        lim = cfg["limits"]
+        self.rpm_max = float(lim["rpm_max"])
+        self.rpm_cap = float(lim["rpm_cap"])
+        self.fin_deg_max = float(lim["fin_deg_max"])
+        self.fin_deg_cap = float(lim["fin_deg_cap"])
+        if not (0.0 < self.rpm_cap <= self.rpm_max):
+            raise ValueError("limits: require 0 < rpm_cap <= rpm_max")
+        if not (0.0 < self.fin_deg_cap <= self.fin_deg_max):
+            raise ValueError("limits: require 0 < fin_deg_cap <= fin_deg_max")
 
         pid_cfg = cfg["pid"]
         self.pid = Pid(
@@ -135,8 +129,8 @@ class DepthControl(Node):
         self.fins: List[str] = list(self.actuators.get("fins", []))
 
         self.heave_sign = float(self.limits.get("heave_sign", 1.0))
-        self.surge_pwm = float(self.limits.get("surge_pwm", self.pwm_neutral))
-        self.fin_pwm = float(self.limits.get("fin_pwm", self.pwm_neutral))
+        self.surge_rpm = float(self.limits.get("surge_rpm", 0.0))
+        self.fin_deg = float(self.limits.get("fin_deg", 0.0))
 
         self.settle_tol = float(self.behaviour["settle_tolerance_m"])
         self.settle_time_s = float(self.behaviour["settle_time_s"])
@@ -164,8 +158,7 @@ class DepthControl(Node):
         self.timer = self.create_timer(self.dt, self._tick)
         self.get_logger().info(
             f"Depth PID → absolute z_d={self.setpoint:.2f} m | "
-            f"PWM neutral={self.pwm_neutral:.0f} cap=[{self.pwm_cap_min:.0f},"
-            f"{self.pwm_cap_max:.0f}] | settle |err|<{self.settle_tol:.2f} m "
+            f"heave cap=±{self.rpm_cap:.0f} RPM | settle |err|<{self.settle_tol:.2f} m "
             f"for {self.settle_time_s:.0f} s, then stop"
         )
 
@@ -173,27 +166,21 @@ class DepthControl(Node):
         self.z = float(msg.pose.pose.position.z)
         self._have_odom = True
 
-    def _to_pwm(self, signed_delta: float) -> float:
-        """Map signed effort (µs from neutral) to capped PWM."""
-        return clamp(
-            self.pwm_neutral + signed_delta,
-            self.pwm_cap_min,
-            self.pwm_cap_max,
-        )
+    def _to_rpm(self, signed_rpm: float) -> float:
+        """Soft-cap a signed thruster command [RPM]."""
+        return clamp(signed_rpm, -self.rpm_cap, self.rpm_cap)
 
-    def _value_map(self, heave_pwm: float) -> Dict[str, float]:
-        values = {name: self.pwm_neutral for name in self.actuator_names}
-        values[self.heave_fwd] = heave_pwm
-        values[self.heave_aft] = heave_pwm
-        values[self.surge] = clamp(
-            self.surge_pwm, self.pwm_cap_min, self.pwm_cap_max
-        )
+    def _value_map(self, heave_rpm: float) -> Dict[str, float]:
+        values = {name: 0.0 for name in self.actuator_names}
+        values[self.heave_fwd] = heave_rpm
+        values[self.heave_aft] = heave_rpm
+        values[self.surge] = self._to_rpm(self.surge_rpm)
         for fin in self.fins:
-            values[fin] = clamp(self.fin_pwm, self.pwm_cap_min, self.pwm_cap_max)
+            values[fin] = clamp(self.fin_deg, -self.fin_deg_cap, self.fin_deg_cap)
         return values
 
-    def _publish(self, heave_pwm: float) -> None:
-        values = self._value_map(heave_pwm)
+    def _publish(self, heave_rpm: float) -> None:
+        values = self._value_map(heave_rpm)
         msg = Actuator()
         msg.actuator_names = list(self.actuator_names)
         msg.actuator_values = [float(values[n]) for n in self.actuator_names]
@@ -201,7 +188,7 @@ class DepthControl(Node):
         self.pub.publish(msg)
 
     def publish_neutral(self) -> None:
-        self._publish(self.pwm_neutral)
+        self._publish(0.0)
 
     def _tick(self) -> None:
         wait = bool(self.behaviour.get("wait_for_odometry", True))
@@ -213,18 +200,18 @@ class DepthControl(Node):
             self.publish_neutral()
             return
 
-        # NED: positive error → too shallow → PWM above neutral (dive)
+        # NED: positive error → too shallow → heave RPM in dive direction
         error = self.setpoint - self.z
         u = self.pid.update(error, self.dt)
-        heave_pwm = self._to_pwm(self.heave_sign * u)
-        self._publish(heave_pwm)
+        heave_rpm = self._to_rpm(self.heave_sign * u)
+        self._publish(heave_rpm)
 
         if abs(error) < self.settle_tol:
             self._settle_elapsed += self.dt
             if self._settle_elapsed >= self.settle_time_s:
                 self.get_logger().info(
                     f"Settled at z={self.z:.2f} m (err={error:.3f}) for "
-                    f"{self.settle_time_s:.0f} s. Neutral PWM and exiting."
+                    f"{self.settle_time_s:.0f} s. Zeroing actuators and exiting."
                 )
                 self.publish_neutral()
                 raise SystemExit(0)
@@ -236,7 +223,7 @@ class DepthControl(Node):
             self._status_elapsed = 0.0
             self.get_logger().info(
                 f"z={self.z:.2f} m  z_d={self.setpoint:.2f}  "
-                f"err={error:.3f}  heave={heave_pwm:.0f} µs  "
+                f"err={error:.3f}  heave={heave_rpm:.0f} RPM  "
                 f"settle={self._settle_elapsed:.1f}/{self.settle_time_s:.0f} s"
             )
 

@@ -21,11 +21,17 @@ def generate_launch_description() -> LaunchDescription:
         description="CompressedImage camera topic",
     )
     topic = LaunchConfiguration("topic")
+    config_arg = DeclareLaunchArgument(
+        "config",
+        default_value=str(root / "dock_detection.yaml"),
+        description="Detection tuning YAML",
+    )
+    config = LaunchConfiguration("config")
 
     # ExecuteProcess keeps this folder self-contained (no ament package needed).
     node = ExecuteProcess(
-        cmd=["python3", script, "--topic", topic],
+        cmd=["python3", script, "--topic", topic, "--config", config],
         cwd=str(root),
         output="screen",
     )
-    return LaunchDescription([topic_arg, node])
+    return LaunchDescription([topic_arg, config_arg, node])

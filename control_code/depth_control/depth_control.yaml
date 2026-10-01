@@ -1,5 +1,7 @@
 # Depth PID controller — all tunable parameters live here.
-# Frame: NED (z positive down). Positive heave effort → PWM > neutral (dive).
+# Frame: NED (z positive down). The PID output is a 'dive demand' (+ = go deeper). The heave thrusters point UP
+# (Mako_01.mavsim: orientation pitch=+90 deg), so positive RPM = UP and a dive needs NEGATIVE RPM -> limits.heave_sign = -1.
+# Command units: th_XX = RPM, cs_XX = degrees (the bridge forwards them raw).
 
 node:
   name: depth_control
@@ -30,33 +32,33 @@ actuators:
     - cs_07
     - cs_08
 
-# ESC / servo PWM (µs). Stop = neutral. Commands are soft-capped.
-pwm:
-  min: 1100.0
-  max: 1900.0
-  neutral: 1500.0
-  # Soft command limits (must lie within min/max)
-  cap_min: 1200.0
-  cap_max: 1800.0
-
 depth:
   # Desired absolute NED depth [m] (positive = deeper).
-  setpoint_m: 5.0
+  setpoint_m: 10.0
 
 pid:
-  # Output is signed PWM delta from neutral [µs]
-  kp: 80.0          # µs per metre of depth error
-  ki: 8.0           # µs per (m·s) integrated error
-  kd: 40.0          # µs per (m/s) depth-rate error
-  i_max: 200.0      # integral clamp [µs]
+  # Output is signed heave thruster RPM
+  kp: 300.0         # RPM per metre of depth error
+  ki: 30.0          # RPM per (m·s) integrated error
+  kd: 150.0         # RPM per (m/s) depth-rate error
+  i_max: 500.0      # integral clamp [RPM]
   d_filter_tau_s: 0.05
 
 limits:
-  # Hold surge / fins at neutral while depth controlling
-  surge_pwm: 1500.0
-  fin_pwm: 1500.0
-  # Flip if PWM > neutral surfaces instead of diving
-  heave_sign: 1.0
+  # Sim units: th_XX = RPM, cs_XX = degrees. 0 = stop / centred.
+  # Hardware limits from Mako_01.mavsim: thrusters ±2668 RPM, fins ±35 deg.
+  rpm_max: 2668.0
+  fin_deg_max: 35.0
+  # Soft command caps (must be <= the hardware limits above)
+  rpm_cap: 1000.0   # NOTE: marginal for this vehicle. Net buoyancy is +7.25 N and (assumed thrust law) both heave
+                    # thrusters give only ~7 N at 1000 RPM, so there is almost no margin to dive. See station_keeping.yaml (1800).
+  fin_deg_cap: 25.0
+  # Hold surge / fins at zero while depth controlling
+  surge_rpm: 0.0
+  fin_deg: 0.0
+  # -1.0 because both heave thrusters point UP: dive demand (+) must become NEGATIVE RPM.
+  # (Was +1.0, which would have driven the vehicle UP whenever it needed to dive.)
+  heave_sign: -1.0
 
 behaviour:
   # Within this band counts as "at depth" [m]

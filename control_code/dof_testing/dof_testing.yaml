@@ -1,0 +1,105 @@
+# Per-DOF actuator test + tuning harness for Mako_01.
+# Run ONE DOF at a time:   ./run_dof_testing.sh --dof heave --mode step
+#                          ./run_dof_testing.sh --dof heave --mode hold
+# Recommended order (each DOF only after the previous one passes): surge -> heave -> pitch -> yaw -> roll -> sway.
+#
+# Units: forces [N], moments [N*m], angles [deg] in this file (converted internally), depth [m] NED (+down).
+# Wrench sign convention (body frame): X fwd, Z DOWN, K roll (+ starboard down), M pitch (+ nose UP),
+# N yaw (+ bow to starboard). A POSITIVE heave (Z) demand pushes the vehicle DOWN -> NEGATIVE thruster RPM,
+# because both heave thrusters point UP (positive RPM = up).
+#
+# What each mode answers:
+#   step : OPEN LOOP. Apply a fixed wrench on that DOF only. Prints PASS/FAIL on the DIRECTION of the response.
+#          => verifies actuator allocation + signs (do this first on the real sim).
+#   hold : CLOSED LOOP. A PID tracks a setpoint on that DOF. Prints PASS/FAIL on final error.
+#          => verifies and tunes gains.
+# Yaw, roll, sway have NO authority at zero speed (fins need flow) so the harness first drives the axial
+# thruster to `cruise_speed_mps`, then tests. Sway has no actuator at all: it is produced by yawing while moving.
+
+node:
+  rate_hz: 20.0
+  ros_domain_id: 42
+  vessel: Mako_01
+
+topics:
+  odometry: /Mako_01/odometry_sim      # nav_msgs/Odometry (pose NED; twist ASSUMED body-frame)
+  actuator_cmd: /Mako_01/actuator_cmd  # interfaces/Actuator
+
+# Hard command caps applied by the allocator (hardware: +-2668 RPM, +-35 deg).
+limits:
+  # With the assumed thrust law (see common/mako_geometry.yaml, rpm_to_rps) the two heave thrusters give about
+  # 7 N TOTAL at 1000 RPM, but the vehicle floats up with 7.25 N net buoyancy => at 1000 RPM it can barely hold depth.
+  # 1800 RPM gives ~23 N. Raise only if the logs show saturation; lower for gentler first tests.
+  rpm_cap: 1800.0
+  fin_deg_cap: 25.0
+  # Fin gain scheduling (force ~ U^2): below u_fin_off the fins are switched off, fully on above u_fin_full.
+  u_fin_min_mps: 0.4     # divisor floor: demand/U^2 never uses U below this (prevents huge deflections)
+  u_fin_off_mps: 0.15
+  u_fin_full_mps: 0.5
+
+# Setpoints for the closed-loop (hold) tests, relative to where the test starts.
+hold:
+  surge_ahead_m: 2.0       # move this far ahead along the start heading and stop
+  heave_delta_m: 1.0       # dive this much deeper (negative = rise)
+  pitch_deg: 10.0          # nose-up angle to hold
+  yaw_delta_deg: 30.0      # turn this much to starboard (needs speed)
+  roll_deg: 15.0           # roll angle to hold (needs speed; roll authority is small)
+  sway_offset_m: 1.0       # lateral shift to starboard, achieved by yaw-and-surge (needs speed)
+
+# Fixed wrench for the open-loop (step) tests.
+step:
+  # Per-DOF duration [s]. Pitch and roll are SHORT PULSES on purpose: this vehicle has no righting moment
+  # (CG == CB) and no pitch/roll damping, so a constant moment makes it spin up without limit. Analogy:
+  # a gentle flick of a free-spinning top - one tap tells you the direction, holding your finger on it
+  # just winds it up until the safety limit trips.
+  duration_s: {surge: 6.0, heave: 6.0, pitch: 2.0, yaw: 6.0, roll: 1.5, sway: 6.0}
+  surge_n: 6.0             # X [N]
+  heave_n: 12.0            # Z [N], + = down. Must beat the +7.25 N net buoyancy or the vehicle still rises.
+  pitch_nm: 0.5            # M [N*m], + = nose up (2 s pulse -> about 15 deg, 0.3 rad/s)
+  yaw_nm: 0.8              # N [N*m], + = bow to starboard (at cruise speed)
+  roll_nm: 0.02            # K [N*m] (roll inertia is tiny, ~0.06 kg*m^2: 1.5 s pulse -> about 20 deg)
+  # Minimum response (in the expected direction) to call a step PASS, in the measured rate's unit
+  # (m/s for surge/heave/sway, rad/s for pitch/yaw/roll).
+  min_response: {surge: 0.05, heave: 0.03, pitch: 0.02, yaw: 0.02, roll: 0.01, sway: 0.01}
+
+fin_dofs:
+  cruise_speed_mps: 1.0    # forward speed the harness holds for yaw / roll / sway tests
+  spinup_timeout_s: 20.0
+
+timing:
+  baseline_s: 2.0          # zero-command window before the test to measure the drift (buoyancy float-up etc.)
+  hold_duration_s: 40.0    # length of a closed-loop test
+  settle_fraction: 0.2     # PASS error is averaged over the last this-fraction of the hold test
+
+# PASS tolerances for hold tests (average over the settle window).
+tolerance: {surge_m: 0.3, heave_m: 0.15, pitch_deg: 3.0, yaw_deg: 5.0, roll_deg: 5.0, sway_m: 0.3}
+
+# Keep the rest of the vehicle still while one DOF is tested. Heave and pitch are held by their
+# own loops (below) in every test except when they are the DOF under test.
+background:
+  hold_depth_and_pitch: true
+  # Net buoyancy feed-forward [N down]: the vehicle floats up with 7.25 N (Mako_01.mavsim). The loop
+  # adds this so the integrator does not have to wind up. Set 0 to see the raw integral-only behaviour.
+  heave_ff_n: 7.25
+
+safety:
+  min_depth_m: 0.4         # abort + neutral if shallower than this (surface = 0)
+  max_depth_m: 20.0
+  max_pitch_deg: 60.0
+  max_roll_deg: 60.0
+
+# PID gains. Output units: heave/surge/speed [N], pitch/yaw/roll [N*m]. Error = setpoint - measurement;
+# the D term uses the measured RATE (depth rate, pitch rate q, yaw rate r, ...), not the error derivative.
+# These start values come from the OFFLINE model (sim_offline/); expect to retune on the real sim.
+gains:
+  heave:  {kp: 60.0, ki: 0.5, kd: 60.0, i_max: 8.0,  max: 25.0}   # N per m, N per m*s, N per m/s
+  pitch:  {kp: 6.0,  ki: 0.3, kd: 5.0,  i_max: 2.0,  max: 4.0}    # N*m per rad, ...
+  surge:  {kp: 8.0,  ki: 0.3, kd: 25.0, i_max: 4.0,  max: 20.0}   # N per m, N per m*s, N per m/s
+  speed:  {kp: 25.0, ki: 6.0, kd: 0.0,  i_max: 15.0, max: 30.0}   # N per m/s forward-speed error
+  yaw:    {kp: 3.0,  ki: 0.1, kd: 3.0,  i_max: 0.5,  max: 3.0}    # N*m per rad
+  roll:   {kp: 0.5,  ki: 0.02, kd: 0.2, i_max: 0.1,  max: 0.5}    # N*m per rad
+  cross_track: {kp: 0.35, ki: 0.0, kd: 0.0, i_max: 0.0, max_heading_deg: 30.0}   # rad of heading offset per m
+
+logging:
+  dir: ~/dof_testing_logs  # one CSV per run
+  status_period_s: 2.0

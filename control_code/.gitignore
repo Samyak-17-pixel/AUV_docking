@@ -6,3 +6,4 @@ ws/log/
 *.pyc
 *.pyo
 .DS_Store
+.pytest_cache/

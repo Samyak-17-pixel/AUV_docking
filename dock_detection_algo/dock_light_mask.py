@@ -99,6 +99,17 @@ def _cores_from_peaks(
     core_pct: int,
     max_blobs: int,
     min_area: float,
+    search_dilate_k: int = 9,
+    dog_sigma_small: float = 1.2,
+    dog_sigma_large: float = 4.0,
+    tight_floor: float = 200.0,
+    tight_default: float = 220.0,
+    tight_erode_k: int = 3,
+    response_min: float = 0.05,
+    peak_abs_v_floor: float = 160.0,
+    peak_abs_v_frac: float = 0.7,
+    refine_half_window: int = 2,
+    fallback_dist_min: float = 1.0,
 ) -> List[Core]:
     """Find light cores as local maxima even when bloom blobs merge.
 
@@ -115,12 +126,13 @@ def _cores_from_peaks(
     if cv2.countNonZero(search) < 5:
         return []
     search = cv2.dilate(
-        search, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1
+        search, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (search_dilate_k, search_dilate_k)),
+        iterations=1,
     )
 
     # --- Response A: DoG (positive lobes ≈ bright cores) ---
-    g_small = cv2.GaussianBlur(v_f, (0, 0), 1.2)
-    g_large = cv2.GaussianBlur(v_f, (0, 0), 4.0)
+    g_small = cv2.GaussianBlur(v_f, (0, 0), float(dog_sigma_small))
+    g_large = cv2.GaussianBlur(v_f, (0, 0), float(dog_sigma_large))
     dog = cv2.subtract(g_small, g_large)
     dog = np.maximum(dog, 0.0)
     dog[search == 0] = 0.0
@@ -131,14 +143,15 @@ def _cores_from_peaks(
         pct = float(np.clip(core_pct, 80, 99))
         tight_thr = float(np.percentile(inside, pct))
         # Never go below a floor so dark frames still work
-        tight_thr = max(tight_thr, 200.0)
+        tight_thr = max(tight_thr, float(tight_floor))
     else:
-        tight_thr = 220.0
+        tight_thr = float(tight_default)
     tight = np.zeros_like(bloom)
     tight[(v_f >= tight_thr) & (search > 0)] = 255
     # Split merged lobes a bit
     tight = cv2.erode(
-        tight, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1
+        tight, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tight_erode_k, tight_erode_k)),
+        iterations=1,
     )
     dist = cv2.distanceTransform(tight, cv2.DIST_L2, 5)
 
@@ -156,16 +169,16 @@ def _cores_from_peaks(
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     dil = cv2.dilate(response, kernel)
     # Strict local max + enough strength
-    peak_map = (response >= dil - 1e-6) & (response > 0.05)
+    peak_map = (response >= dil - 1e-6) & (response > response_min)
     # Also require some absolute brightness so murk peaks die
-    peak_map &= v_f > max(160.0, tight_thr * 0.7)
+    peak_map &= v_f > max(peak_abs_v_floor, tight_thr * peak_abs_v_frac)
     peak_map &= search > 0
 
     ys, xs = np.where(peak_map)
     if len(xs) == 0:
         # Fallback: peaks on distance alone
         dil_d = cv2.dilate(dist, kernel)
-        peak_map = (dist >= dil_d - 1e-6) & (dist > 1.0) & (search > 0)
+        peak_map = (dist >= dil_d - 1e-6) & (dist > fallback_dist_min) & (search > 0)
         ys, xs = np.where(peak_map)
 
     if len(xs) == 0:
@@ -179,8 +192,9 @@ def _cores_from_peaks(
     refined: List[Core] = []
     for x, y in cores:
         xi, yi = int(round(x)), int(round(y))
-        x0, x1 = max(0, xi - 2), min(w, xi + 3)
-        y0, y1 = max(0, yi - 2), min(h, yi + 3)
+        r = int(refine_half_window)
+        x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+        y0, y1 = max(0, yi - r), min(h, yi + r + 1)
         patch = response[y0:y1, x0:x1]
         if patch.size == 0 or float(patch.sum()) <= 1e-6:
             refined.append((x, y))
@@ -208,6 +222,17 @@ def bloom_mask_and_cores(
     peak_mode: bool = True,
     peak_sep: int = 28,
     core_pct: int = 92,
+    search_dilate_k: int = 9,
+    dog_sigma_small: float = 1.2,
+    dog_sigma_large: float = 4.0,
+    tight_floor: float = 200.0,
+    tight_default: float = 220.0,
+    tight_erode_k: int = 3,
+    response_min: float = 0.05,
+    peak_abs_v_floor: float = 160.0,
+    peak_abs_v_frac: float = 0.7,
+    refine_half_window: int = 2,
+    fallback_dist_min: float = 1.0,
 ) -> Tuple[np.ndarray, List[Core]]:
     """Bloom mask for display + robust cores (peaks when lights merge).
 
@@ -240,6 +265,17 @@ def bloom_mask_and_cores(
             core_pct=core_pct,
             max_blobs=max_blobs if max_blobs > 0 else 4,
             min_area=min_area,
+            search_dilate_k=search_dilate_k,
+            dog_sigma_small=dog_sigma_small,
+            dog_sigma_large=dog_sigma_large,
+            tight_floor=tight_floor,
+            tight_default=tight_default,
+            tight_erode_k=tight_erode_k,
+            response_min=response_min,
+            peak_abs_v_floor=peak_abs_v_floor,
+            peak_abs_v_frac=peak_abs_v_frac,
+            refine_half_window=refine_half_window,
+            fallback_dist_min=fallback_dist_min,
         )
     else:
         cores = _cores_from_contours(mask, min_area, max_blobs)

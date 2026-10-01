@@ -1,0 +1,53 @@
+# Mako_01 vehicle geometry used by allocation.py and the offline model.
+# SOURCE: Mako_01.mavsim -> config.json -> agents[0] (extracted 2026-10-01).
+# Body frame: x forward, y starboard, z DOWN (NED-style). Euler order ZYX (deg), matching mavsim.
+# Wrench order everywhere: [X, Y, Z, K, M, N] = surge, sway, heave(+down), roll, pitch(+nose up), yaw(+bow to starboard).
+#
+# Items marked ASSUMPTION are NOT in the config / not verified in the sim. Verify them on the
+# first real-sim run (dof_testing is built for that) and then edit here, in one place.
+
+vehicle:
+  rho: 1000.0                    # kg/m^3 (config: density)
+  gravity: 9.80665
+  mass_kg: 10.0
+  buoyancy_mass_kg: 10.739857503097697   # -> net buoyancy = +7.25 N (vehicle floats up by itself)
+  cg_minus_cb_m: [0.0, 0.0, 0.0] # CG == CB in the config -> NO passive pitch/roll righting moment
+  gyration_m: [0.078, 0.35, 0.35]        # radii of gyration about x, y, z (config)
+  # Linear drag [N per m/s] and [N*m per rad/s]. Config: X_u=-0.01, Y_v=-0.01, N_r=-0.01, Z_w=K_p=M_q=0.
+  # => essentially NO damping in heave/roll/pitch: the controllers' D-terms must provide it.
+  drag_lin: {X: 0.01, Y: 0.01, Z: 0.0, K: 0.0, M: 0.0, N: 0.01}
+  # ASSUMPTION (offline model only, NOT in the config): quadratic drag, F = -c*|v|*v.
+  # Rough torpedo-hull numbers: frontal area 0.03 m^2 * Cd 0.3 (axial), side/top area 0.27 m^2 * Cd 1.0
+  # (sway/heave), rotational values chosen to give a few-second damped response. Without these the
+  # config's linear drag lets the model reach unphysical speeds (e.g. 6 m/s).
+  drag_quad: {X: 4.5, Y: 135.0, Z: 135.0, K: 0.3, M: 15.0, N: 15.0}
+  # ASSUMPTION: added-mass (config has null -> sim computes its own). Used only by the offline model.
+  added_mass_frac: [0.05, 0.5, 0.5, 0.0, 0.5, 0.5]
+
+thrusters:
+  # unit thrust direction = R(orientation) @ [1,0,0]; positive RPM => thrust along that vector.
+  # Heave thrusters have orientation pitch=+90 deg => thrust vector = body -z = UP.
+  # => positive RPM pushes the vehicle UP; to DIVE command NEGATIVE RPM.
+  th_01: {name: Axial_thruster,    location: [-0.688, 0.0, 0.0], orientation: [0.0,  0.0, 0.0], D: 0.1,  n_max: 2668.0, n_min: -2668.0}
+  th_02: {name: Heave_thruster_1,  location: [ 0.349, 0.0, 0.0], orientation: [0.0, 90.0, 0.0], D: 0.06, n_max: 2668.0, n_min: -2668.0}
+  th_03: {name: Heave_thruster_2,  location: [-0.349, 0.0, 0.0], orientation: [0.0, 90.0, 0.0], D: 0.06, n_max: 2668.0, n_min: -2668.0}
+  # J_vs_KT at J=0 is symmetric in the config: KT = +1 forward, -1 reverse (|KT| = 1 both ways).
+  kt_fwd: 1.0
+  kt_rev: 1.0
+  # ASSUMPTION: thrust = KT * rho * D^4 * n^2 with n in REV PER SECOND, and the commanded th_XX is RPM
+  # => n = RPM/60. (mavsim-controller/teleop/allocation.py feeds the value in directly; unit unconfirmed.)
+  # If the sim thrust is ~60x weaker/stronger than expected, change this single number.
+  rpm_to_rps: 0.016666666666666666
+
+fins:
+  # lift direction = R(orientation) @ [0,1,0] (ASSUMPTION: positive delta gives force along it).
+  # location y,z from config. Config says x=0.0 but the fin geometry (LE/TE root x in -0.418..-0.490 m)
+  # places the fins aft: ASSUMPTION moment arm x = -0.454 m (mid-chord).
+  cs_04: {location: [-0.454,  0.05126524, -0.05126524], orientation: [ 45.0, 0.0, 0.0]}
+  cs_06: {location: [-0.454,  0.05126524,  0.05126524], orientation: [135.0, 0.0, 0.0]}
+  cs_07: {location: [-0.454, -0.05126524,  0.05126524], orientation: [225.0, 0.0, 0.0]}
+  cs_08: {location: [-0.454, -0.05126524, -0.05126524], orientation: [-45.0, 0.0, 0.0]}
+  delta_max_deg: 35.0
+  area_m2: 0.00473336588
+  # ASSUMPTION: lift slope of the small low-aspect fin. Fin force = 0.5*rho*A*cl_alpha*delta_rad*U^2.
+  cl_alpha_per_rad: 2.0

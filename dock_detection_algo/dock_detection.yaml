@@ -1,0 +1,134 @@
+# Dock-light detection — all tunable parameters live here.
+# Loaded by live_dock_lights.py (--config, default: this file). Trackbars in the
+# "Bloom mask" window start at these values; press 'p' in a window to print the
+# current trackbar values as a YAML snippet to paste back here.
+#
+# HOW TO READ THE "EFFECT" COMMENTS
+#   * Pixel numbers assume a ~1280x720 camera frame. Scale linearly with resolution
+#     (640x360 -> halve every "px" figure; 1920x1080 -> x1.5).
+#   * "Considerable change" = a step that visibly changes the mask / cores (a light
+#     appears or disappears, a core moves by several px, or cores merge/split).
+#   * Numbers are derived from what the algorithm computes (thresholds, kernel sizes),
+#     not measured on a recording. Treat them as starting steps: change one parameter
+#     at a time, watch "Dock camera" (cores=N, want 4) and "Bloom mask".
+#   * Pipeline order:  bloom mask -> core peaks (DoG + distance transform + NMS)
+#                      -> label T/B/L/R -> alignment errors / confidence.
+
+camera:
+  # CompressedImage topic. Override on CLI with --topic.
+  topic: /Mako_01/camera_03/image/compressed
+  # Leave "" to derive /<vessel>/dock_align from the camera topic. Override with --align-topic.
+  align_topic: ""
+
+# ---------------------------------------------------------------------------
+# 1) BLOOM MASK  (which pixels count as "light glow")
+# ---------------------------------------------------------------------------
+mask:
+  v_thresh: 180             # HSV Value (brightness, 0-255) floor for a pixel to be "light".
+                            #   UP   -> mask shrinks to only the brightest pixels; dim/far lights vanish.
+                            #   DOWN -> more glow, water murk and reflections leak in; blobs merge.
+                            #   Effect size: ~+/-15 (about 6% of range) changes glow radius by roughly
+                            #   2-6 px on a soft bloom edge; +/-40 can drop a distant light entirely
+                            #   or flood the frame with murk. Usable range 140-230.
+  use_cyan_assist: true     # Also accept cyan/teal pixels even if dimmer than v_thresh (coloured bloom).
+                            #   false -> only white-hot pixels count; coloured halo is ignored, mask
+                            #   is smaller/tighter. true -> mask can grow 10-30% in area near lights.
+  cyan_h_lo: 80             # Hue lower bound (OpenCV hue 0-180; 90 = pure cyan).
+                            #   +/-10 shifts accepted colour by 20 degrees; going below ~70 starts
+                            #   admitting green water, above ~100 admits blue water.
+  cyan_h_hi: 110            # Hue upper bound. Widening the band by 10 typically doubles the amount of
+                            #   background water accepted in blue-tinted scenes.
+  cyan_s_lo: 20             # Min saturation (0-255). UP -> demands more vivid colour, rejects
+                            #   washed-out white-ish glow. +/-20 is a considerable change.
+  cyan_v_lo: 60             # Min brightness for the cyan path only. UP by 30+ removes most dim cyan
+                            #   halo; DOWN by 30+ lets dark cyan water in (usually bad).
+  open_k: 3                 # Morphological OPEN kernel (px, forced odd). Deletes specks smaller than
+                            #   this. 0 disables. Each +2 removes noise ~2 px wider but shrinks small
+                            #   real lights; >9 can erase a distant light (light diameter < kernel).
+  close_k: 7                # Morphological CLOSE kernel (px, forced odd). Fills holes/gaps up to this
+                            #   size and merges neighbouring blobs closer than ~k px. 0 disables.
+                            #   +4 -> lights within ~4 px more get bridged; >21 tends to glue the
+                            #   whole dock into one blob (cores then rely on peak_mode).
+  min_area: 20.0            # Smallest blob (px^2) kept in blob mode / fallback. 20 ~ a 5 px dot.
+                            #   x2 removes dots up to ~7 px across; 200 removes anything under ~16 px.
+                            #   No effect when peak_mode finds peaks (only used in fallback).
+  max_blobs: 4              # Max cores returned. Dock has 4 lights -> keep 4. Above 4 lets
+                            #   reflections through and breaks T/B/L/R labelling; below 4 makes
+                            #   geometry always invalid.
+
+# ---------------------------------------------------------------------------
+# 2) CORE PEAK FINDING  (where each light's centre is, even when bloom merges)
+# ---------------------------------------------------------------------------
+peaks:
+  peak_mode: true           # true = local-peak cores (works when lights are close and bloom merges).
+                            #   false = blob centroids (fast, but 4 merged lights become 1 core).
+                            #   Keep true unless lights are always far apart and separate.
+  peak_sep: 28              # Min pixel distance between two cores (NMS radius; forced odd, >=5).
+                            #   Set to ~0.5-0.8x the smallest expected light-to-light spacing.
+                            #   TOO HIGH -> two real lights get merged into one (cores<4).
+                            #   TOO LOW  -> one big light gives 2+ cores (duplicates, cores>4).
+                            #   +/-10 px is considerable; at 28 lights closer than 28 px cannot be
+                            #   separated (dock further than ~6-8 m may need ~12-16).
+  core_pct: 92              # Percentile (80-99) of brightness inside the bloom that forms the "tight
+                            #   core" mask. UP -> tighter cores, better splitting of merged lights,
+                            #   but weak lights may drop out. DOWN -> fatter cores, lights merge.
+                            #   +/-5 points changes core-mask area by roughly 30-50%.
+                            #   Values below 80 are clamped to 80 by the code.
+  tight_floor: 200.0        # Absolute brightness floor (0-255) for the tight core mask, applied even
+                            #   if the percentile is lower. UP -> dim frames give no cores;
+                            #   DOWN -> in dark frames the "core" becomes the whole glow.
+                            #   +/-20 flips behaviour on murky scenes; irrelevant when bloom is saturated.
+  tight_default: 220.0      # Core threshold used only when the bloom mask is empty. Rarely matters.
+  tight_erode_k: 3          # Erosion kernel (px) that splits merged core lobes before distance
+                            #   transform. 3->5 splits lobes joined by a 1-2 px neck but can shrink
+                            #   small lights to nothing (light diameter must exceed this).
+  search_dilate_k: 9        # Bloom mask is grown by this many px before peak search so edge peaks
+                            #   survive. +/-6 px extends the search zone by ~3 px per side; too big
+                            #   lets neighbouring reflections compete for a core slot.
+  dog_sigma_small: 1.2      # Gaussian sigma (px) of the fine blur in Difference-of-Gaussians.
+                            #   Should be about light-core radius/2. UP -> smoother, less noise,
+                            #   less sharp peaks; DOWN -> peaks jitter with JPEG noise (+/-0.5 px
+                            #   changes localisation noise by roughly +/-0.3 px).
+  dog_sigma_large: 4.0      # Gaussian sigma (px) of the coarse blur. Sets the size of blob DoG
+                            #   responds to (~2-3x sigma = light radius). Use >= 2.5x sigma_small.
+                            #   UP -> prefers larger lights (near dock), ignores small distant ones;
+                            #   DOWN -> prefers tiny spots. +/-2 px shifts preferred light radius
+                            #   by ~5 px.
+  response_min: 0.05        # Min normalised (0-1) fused peak strength. UP -> weak peaks rejected
+                            #   (fewer false cores, may lose a dim light); DOWN -> more candidates.
+                            #   0.05 -> 0.15 typically removes ~half the weakest false peaks;
+                            #   above ~0.4 real lights start to drop.
+  peak_abs_v_floor: 160.0   # A peak pixel must be at least this bright (0-255) regardless of the
+                            #   percentile. +/-20 is considerable: kills murky reflections (up) or
+                            #   allows dim lights (down).
+  peak_abs_v_frac: 0.7      # A peak must also be >= this fraction of the tight core threshold
+                            #   (~0.7*200 = 140 minimum). +/-0.1 moves the minimum by ~20 grey levels.
+  refine_half_window: 2     # Half size (px) of the sub-pixel centroid window (2 -> 5x5).
+                            #   UP -> smoother centres but biased toward brighter neighbours
+                            #   (up to ~1 px bias per +1); 0-1 is jittery. Considerable at >= 4.
+  fallback_dist_min: 1.0    # Used only if DoG/response finds nothing: min distance-transform value
+                            #   (px, ~light radius) for a fallback peak. UP -> ignores tiny specks.
+
+# ---------------------------------------------------------------------------
+# 3) ALIGNMENT DECISION  (dock_align message + on-screen "ALIGN OK")
+# ---------------------------------------------------------------------------
+alignment:
+  spread_align_frac: 0.08   # "aligned" if spread(max-min of centre->light distances) is under
+                            #   max(spread_align_min_px, frac * radius_px). 0.08 of a 150 px radius
+                            #   = 12 px. +/-0.04 is considerable (12 px -> 6 or 18 px). Smaller
+                            #   is stricter (must be truly square-on); larger accepts a tilted dock.
+  spread_align_min_px: 8.0  # Lower bound on that threshold so tiny far-away docks (radius < 100 px)
+                            #   are not judged on sub-pixel noise. UP -> more forgiving at range.
+                            #   +/-4 px is considerable at small radii; no effect once
+                            #   frac*radius exceeds it.
+  confidence_base: 0.4      # Confidence = (lights/4) * (base + (1-base) * 1/(1+spread/radius)).
+                            #   `base` is what a 4-light detection scores even if badly skewed.
+                            #   UP -> confidence is more about light count than shape. +/-0.2 moves
+                            #   the score of a skewed-but-complete detection by about +/-0.2.
+
+# ---------------------------------------------------------------------------
+# 4) HUD  (display only — does not change detection or the published message)
+# ---------------------------------------------------------------------------
+hud:
+  hint_deadband_px: 2.0     # |error| below this prints X-OK / Y-OK instead of LEFT/RIGHT/UP/DOWN.
+  ok_error_px: 10.0         # Both |err_x| and |err_y| below this turn the HUD text green.

@@ -40,6 +40,7 @@ def build_dock_align_msg(
     image_height: int,
     spread_align_frac: float = 0.08,
     spread_align_min_px: float = 8.0,
+    confidence_base: float = 0.4,
 ):
     """Fill a DockAlign message. Import interfaces.msg.DockAlign at call site after sourcing ws."""
     from interfaces.msg import DockAlign
@@ -79,7 +80,7 @@ def build_dock_align_msg(
 
     # Confidence: full lights + low spread
     spread_term = 1.0 / (1.0 + geo.spread / max(geo.radius_tb, 1.0))
-    confidence = (msg.num_lights / 4.0) * (0.4 + 0.6 * spread_term)
+    confidence = (msg.num_lights / 4.0) * (confidence_base + (1.0 - confidence_base) * spread_term)
 
     msg.valid = True
     msg.error_x_px = err_x

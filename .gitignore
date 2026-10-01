@@ -13,3 +13,4 @@ control_code/ws/log/
 *.pyc
 *.pyo
 .DS_Store
+CLAUDE.md

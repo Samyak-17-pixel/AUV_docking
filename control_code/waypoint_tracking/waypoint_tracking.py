@@ -2,13 +2,12 @@
 """Waypoint tracking controller for mavsim Mako (ROS 2).
 
 Subscribes to odometry, steers through a YAML waypoint list (NED), and publishes
-interfaces/Actuator on the actuator_cmd topic using ESC/servo PWM (µs).
+interfaces/Actuator on the actuator_cmd topic. Units are what the sim expects
+(the bridge forwards them raw): th_XX = RPM, cs_XX = degrees, 0 = stop/centred.
 
-  - Heading: PID → X-fin yaw mix (PWM around neutral)
-  - Surge: axial thruster PWM when heading is aligned
-  - Depth: PID → heave thruster PWM
-
-PWM: 1100–1900, neutral 1500, soft-capped to 1200–1800.
+  - Heading: PID → X-fin yaw mix (degrees)
+  - Surge: axial thruster RPM when heading is aligned
+  - Depth: PID → heave thruster RPM
 
   export ROS_DOMAIN_ID=42
   source /opt/ros/humble/setup.bash
@@ -121,22 +120,15 @@ class WaypointTracking(Node):
         self.limits = cfg["limits"]
         self.logging_cfg = cfg.get("logging", {})
 
-        pwm = cfg["pwm"]
-        self.pwm_min = float(pwm["min"])
-        self.pwm_max = float(pwm["max"])
-        self.pwm_neutral = float(pwm["neutral"])
-        self.pwm_cap_min = float(pwm["cap_min"])
-        self.pwm_cap_max = float(pwm["cap_max"])
-        if not (
-            self.pwm_min
-            <= self.pwm_cap_min
-            <= self.pwm_neutral
-            <= self.pwm_cap_max
-            <= self.pwm_max
-        ):
-            raise ValueError(
-                "pwm: require min <= cap_min <= neutral <= cap_max <= max"
-            )
+        lim = cfg["limits"]
+        self.rpm_max = float(lim["rpm_max"])
+        self.rpm_cap = float(lim["rpm_cap"])
+        self.fin_deg_max = float(lim["fin_deg_max"])
+        self.fin_deg_cap = float(lim["fin_deg_cap"])
+        if not (0.0 < self.rpm_cap <= self.rpm_max):
+            raise ValueError("limits: require 0 < rpm_cap <= rpm_max")
+        if not (0.0 < self.fin_deg_cap <= self.fin_deg_max):
+            raise ValueError("limits: require 0 < fin_deg_cap <= fin_deg_max")
 
         self.waypoints = self._parse_waypoints(cfg.get("waypoints", []))
         if not self.waypoints:
@@ -150,7 +142,7 @@ class WaypointTracking(Node):
             i_max=float(h.get("i_max", 80.0)),
             d_filter_tau_s=float(h.get("d_filter_tau_s", 0.05)),
         )
-        self.max_fin_delta = float(h["max_fin_delta_us"])
+        self.max_fin_delta = float(h["max_fin_delta_deg"])
         self.align_deg = float(h["align_deg"])
 
         d = cfg["depth_pid"]
@@ -207,8 +199,7 @@ class WaypointTracking(Node):
         self.get_logger().info(
             f"Waypoint tracking: {len(self.waypoints)} wps | "
             f"first=({wp0[0]:.1f},{wp0[1]:.1f},{wp0[2]:.1f}) | "
-            f"PWM neutral={self.pwm_neutral:.0f} "
-            f"cap=[{self.pwm_cap_min:.0f},{self.pwm_cap_max:.0f}]"
+            f"caps ±{self.rpm_cap:.0f} RPM / ±{self.fin_deg_cap:.0f}°"
         )
 
     def _parse_waypoints(
@@ -230,11 +221,11 @@ class WaypointTracking(Node):
             out.append((x, y, z))
         return out
 
-    def _cap_pwm(self, value: float) -> float:
-        return clamp(value, self.pwm_cap_min, self.pwm_cap_max)
+    def _cap_rpm(self, value: float) -> float:
+        return clamp(value, -self.rpm_cap, self.rpm_cap)
 
-    def _delta_to_pwm(self, signed_delta: float) -> float:
-        return self._cap_pwm(self.pwm_neutral + signed_delta)
+    def _cap_fin(self, value: float) -> float:
+        return clamp(value, -self.fin_deg_cap, self.fin_deg_cap)
 
     def _on_odom(self, msg: Odometry) -> None:
         self.x = float(msg.pose.pose.position.x)
@@ -255,14 +246,14 @@ class WaypointTracking(Node):
         self._have_odom = True
 
     def _publish(
-        self, heave_pwm: float, surge_pwm: float, fin_yaw_delta: float
+        self, heave_rpm: float, surge_rpm: float, fin_yaw_deg: float
     ) -> None:
-        values = {name: self.pwm_neutral for name in self.actuator_names}
-        values[self.heave_fwd] = heave_pwm
-        values[self.heave_aft] = heave_pwm
-        values[self.surge_name] = surge_pwm
+        values = {name: 0.0 for name in self.actuator_names}
+        values[self.heave_fwd] = heave_rpm
+        values[self.heave_aft] = heave_rpm
+        values[self.surge_name] = surge_rpm
         for name, sign in zip(self.fins, self.fin_yaw_signs):
-            values[name] = self._delta_to_pwm(sign * fin_yaw_delta)
+            values[name] = self._cap_fin(sign * fin_yaw_deg)
 
         msg = Actuator()
         msg.actuator_names = list(self.actuator_names)
@@ -271,7 +262,7 @@ class WaypointTracking(Node):
         self.pub.publish(msg)
 
     def publish_neutral(self) -> None:
-        self._publish(self.pwm_neutral, self.pwm_neutral, 0.0)
+        self._publish(0.0, 0.0, 0.0)
 
     def _advance_if_reached(self, dx: float, dy: float, dz: float) -> bool:
         r_xy = math.hypot(dx, dy)
@@ -328,30 +319,27 @@ class WaypointTracking(Node):
         fin_cmd = self.heading_pid.update(heading_error_deg, self.dt)
         fin_yaw_delta = clamp(fin_cmd, -self.max_fin_delta, self.max_fin_delta)
 
-        cruise = float(self.surge_cfg["cruise_pwm"])
-        creep = float(self.surge_cfg.get("creep_pwm", self.pwm_neutral))
+        cruise = float(self.surge_cfg["cruise_rpm"])
+        creep = float(self.surge_cfg.get("creep_rpm", 0.0))
         if abs(heading_error_deg) <= self.align_deg:
             if bool(self.surge_cfg.get("scale_with_heading", True)):
-                scale = math.cos(heading_error)
-                # Blend from neutral toward cruise with heading alignment
-                surge_pwm = self.pwm_neutral + (cruise - self.pwm_neutral) * max(
-                    0.0, scale
-                )
+                # Blend from zero toward cruise with heading alignment
+                surge_rpm = cruise * max(0.0, math.cos(heading_error))
             else:
-                surge_pwm = cruise
+                surge_rpm = cruise
         else:
-            surge_pwm = creep
-        surge_pwm = clamp(
-            surge_pwm,
-            float(self.surge_cfg.get("pwm_min", self.pwm_cap_min)),
-            float(self.surge_cfg.get("pwm_max", self.pwm_cap_max)),
+            surge_rpm = creep
+        surge_rpm = clamp(
+            surge_rpm,
+            float(self.surge_cfg.get("rpm_min", 0.0)),
+            float(self.surge_cfg.get("rpm_max", self.rpm_cap)),
         )
-        surge_pwm = self._cap_pwm(surge_pwm)
+        surge_rpm = self._cap_rpm(surge_rpm)
 
         heave_u = self.depth_pid.update(depth_error, self.dt)
-        heave_pwm = self._delta_to_pwm(self.heave_sign * heave_u)
+        heave_rpm = self._cap_rpm(self.heave_sign * heave_u)
 
-        self._publish(heave_pwm, surge_pwm, fin_yaw_delta)
+        self._publish(heave_rpm, surge_rpm, fin_yaw_delta)
 
         self._status_elapsed += self.dt
         if self._status_period > 0.0 and self._status_elapsed >= self._status_period:
@@ -361,8 +349,8 @@ class WaypointTracking(Node):
                 f"WP{self.wp_idx}/{len(self.waypoints)-1} "
                 f"pos=({self.x:.1f},{self.y:.1f},{self.z:.1f}) "
                 f"r_xy={r_xy:.1f} hd_err={heading_error_deg:.1f}° "
-                f"surge={surge_pwm:.0f} heave={heave_pwm:.0f} "
-                f"finΔ={fin_yaw_delta:.0f} µs"
+                f"surge={surge_rpm:.0f} RPM heave={heave_rpm:.0f} RPM "
+                f"fin={fin_yaw_delta:.1f}°"
             )
 
 

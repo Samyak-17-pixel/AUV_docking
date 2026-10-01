@@ -109,7 +109,14 @@ def evaluate_dock_geometry(cores: List[Core]) -> DockGeometry:
     )
 
 
-def draw_dock_geometry(bgr: np.ndarray, geo: DockGeometry, n_cores: int) -> np.ndarray:
+def draw_dock_geometry(
+    bgr: np.ndarray,
+    geo: DockGeometry,
+    n_cores: int,
+    *,
+    spread_align_frac: float = 0.08,
+    spread_align_min_px: float = 8.0,
+) -> np.ndarray:
     """Overlay diameter, center, radii, and distance readout on the camera image."""
     vis = bgr.copy()
     cv2.putText(
@@ -208,7 +215,7 @@ def draw_dock_geometry(bgr: np.ndarray, geo: DockGeometry, n_cores: int) -> np.n
         )
 
     # Compact alignment hint
-    aligned = geo.spread < max(8.0, 0.08 * geo.radius_tb)
+    aligned = geo.spread < max(spread_align_min_px, spread_align_frac * geo.radius_tb)
     hint = "ALIGN OK" if aligned else "ALIGN OFF"
     hint_color = (0, 255, 0) if aligned else (0, 128, 255)
     cv2.putText(
