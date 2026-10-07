@@ -19,6 +19,11 @@ camera:
   topic: /Mako_01/camera_03/image/compressed
   # Leave "" to derive /<vessel>/dock_align from the camera topic. Override with --align-topic.
   align_topic: ""
+  # Leave "" to derive /<vessel>/imu_01/data. Roll is removed before labelling;
+  # pitch is added to the pixel angle to get the dock center's elevation.
+  imu_topic: ""
+  # Horizontal field of view of camera_03 in the sim (square pixels assumed).
+  hfov_deg: 60.0
 
 # ---------------------------------------------------------------------------
 # 1) BLOOM MASK  (which pixels count as "light glow")
@@ -125,6 +130,27 @@ alignment:
                             #   `base` is what a 4-light detection scores even if badly skewed.
                             #   UP -> confidence is more about light count than shape. +/-0.2 moves
                             #   the score of a skewed-but-complete detection by about +/-0.2.
+  lateral_exact_px: 8.0    # Side-light midpoint must sit within this many pixels of the
+                            #   top–bottom line before the cross-ratio center is trusted.
+                            #   Otherwise the center falls back to the diameter midpoint.
+  lateral_exact_frac: 0.06 # The same gate as a fraction of the top–bottom radius. The
+                            #   larger of this and lateral_exact_px is used.
+
+# ---------------------------------------------------------------------------
+# 5) PARTIAL-LIGHT SEARCH  (published only while fewer than 4 lights are trusted)
+# ---------------------------------------------------------------------------
+acquire:
+  edge_frac: 0.10           # A core within this fraction of the width/height is "on the edge".
+                            #   The search yaws or pitches toward that edge instead of nodding.
+  nod_pitch_deg: 20.0       # Pitch nod amplitude when the seen lights are inside the frame.
+                            #   Covers the 2 m light circle beyond about 3 m range.
+  yaw_wiggle_deg: 8.0       # Smaller yaw wiggle added to that nod. Needs forward speed.
+  nod_period_s: 8.0         # Seconds for one full nod. Also the wait before backing up.
+  backup_radius_frac: 0.22  # If the cluster radius exceeds this fraction of the image height
+                            #   for a full nod period, the dock is too close: surge command is -1.
+  backup_after_s: 8.0       # How long the interior nod must fail before that reverse command.
+  flow_surge_norm: 0.35     # Forward surge asked whenever a yaw search or a yaw correction
+                            #   needs fin flow. 1 would be full axial command; this is a hint.
 
 # ---------------------------------------------------------------------------
 # 4) HUD  (display only — does not change detection or the published message)

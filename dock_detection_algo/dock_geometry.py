@@ -1,7 +1,16 @@
-"""Dock light geometry: label Top/Bottom/Left/Right and measure radii from center."""
+"""Dock light geometry: label Top/Bottom/Left/Right and measure radii from center.
+
+The four dock lights lie on a 1 m circle. Top and bottom are a vertical diameter.
+The two side lights are both above the dock center, at ±45° from the top, so their
+3D midpoint lies on that diameter. A level, square-on view projects the circle to a
+circle and the diameter midpoint is the dock center. A pitched view projects an
+ellipse: the diameter midpoint is pulled toward the nearer light, and the side-light
+distances leave the top–bottom radius even when heading is already correct.
+"""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -9,6 +18,12 @@ import cv2
 import numpy as np
 
 Core = Tuple[float, float]
+
+# Side-light midpoint, as a fraction of the top→bottom segment. z is down:
+# top z=-1, side midpoint z=-√2/2, bottom z=+1.
+FRONTAL_FRACTION = (1.0 - math.sqrt(2.0) / 2.0) / 2.0
+# Cross-ratio (top, side-midpoint; center, bottom) on that diameter.
+_CENTER_CROSS_RATIO = (1.0 + math.sqrt(2.0)) / 2.0
 
 
 @dataclass
@@ -20,19 +35,31 @@ class DockGeometry:
     bottom: Optional[Core] = None
     left: Optional[Core] = None
     right: Optional[Core] = None
+    # Guidance center: cross-ratio dock center when center_exact, else top–bottom midpoint.
     center: Optional[Core] = None
-    # Distance from vertical-diameter center to each light [px]
+    # Midpoint of the top–bottom segment. Spread is always measured from here.
+    diameter_mid: Optional[Core] = None
+    # Distance from the diameter midpoint to each light [px]
     d_top: float = 0.0
     d_bottom: float = 0.0
     d_left: float = 0.0
     d_right: float = 0.0
     # Expected radius from top–bottom diameter
     radius_tb: float = 0.0
-    # How unequal the four radii are (0 ≈ front-on / perpendicular)
+    # How unequal the four radii are (0 ≈ front-on / perpendicular, level camera)
     spread: float = 0.0
     # Side errors vs diameter radius
     err_left: float = 0.0
     err_right: float = 0.0
+    # Signed px: side-light midpoint to the right of the directed top→bottom line.
+    # Near zero when the heading is perpendicular to the dock, including a pure
+    # sideways shift. A yaw, especially at close range, pulls it off the line.
+    lateral_px: float = 0.0
+    # True when the side midpoint lies on the diameter, so the cross-ratio center is valid.
+    center_exact: bool = False
+    # Fraction of side midpoint along top→bottom, minus FRONTAL_FRACTION.
+    # Positive when the upper half is foreshortened (camera above the dock and pitched).
+    obliqueness: float = 0.0
     message: str = ""
 
 
@@ -42,6 +69,56 @@ def _dist(a: Core, b: Core) -> float:
 
 def _mid(a: Core, b: Core) -> Core:
     return (0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]))
+
+
+def unrotate_cores(cores: List[Core], roll_rad: float, cx: float, cy: float) -> List[Core]:
+    """Undo camera roll about the image center.
+
+    Positive roll is starboard-down. In x-right, y-down pixels that tips the image
+    right side downward, and rotating the measured cores by +roll puts the
+    top–bottom diameter back on the image vertical.
+    """
+    if not cores or abs(roll_rad) < 1e-6:
+        return list(cores)
+    c = math.cos(roll_rad)
+    s = math.sin(roll_rad)
+    out: List[Core] = []
+    for x, y in cores:
+        dx, dy = x - cx, y - cy
+        out.append((cx + c * dx - s * dy, cy + s * dx + c * dy))
+    return out
+
+
+def _line_direction(top: Core, bottom: Core) -> Optional[Tuple[np.ndarray, float]]:
+    tb = np.array(bottom, dtype=float) - np.array(top, dtype=float)
+    length = float(np.linalg.norm(tb))
+    if length < 5.0:
+        return None
+    return tb / length, length
+
+
+def _along(point: Core, top: Core, direction: np.ndarray) -> float:
+    rel = np.array(point, dtype=float) - np.array(top, dtype=float)
+    return float(np.dot(rel, direction))
+
+
+def _lateral(point: Core, top: Core, direction: np.ndarray) -> float:
+    """Signed pixels to image-right of the directed top→bottom line."""
+    rel = np.array(point, dtype=float) - np.array(top, dtype=float)
+    return float(rel[0] * direction[1] - rel[1] * direction[0])
+
+
+def _cross_ratio_center(top: Core, direction: np.ndarray, length: float, along_m: float) -> Optional[Core]:
+    """Image of the dock center from the known cross-ratio along the diameter."""
+    denom = length - along_m
+    if abs(denom) < 1e-3:
+        return None
+    k = _CENTER_CROSS_RATIO * length / denom
+    if abs(1.0 - k) < 1e-6:
+        return None
+    along_o = (-k * along_m) / (1.0 - k)
+    xy = np.array(top, dtype=float) + along_o * direction
+    return (float(xy[0]), float(xy[1]))
 
 
 def label_dock_lights(cores: List[Core]) -> Optional[Dict[str, Core]]:
@@ -67,8 +144,19 @@ def label_dock_lights(cores: List[Core]) -> Optional[Dict[str, Core]]:
     return {"top": top, "bottom": bottom, "left": left, "right": right}
 
 
-def evaluate_dock_geometry(cores: List[Core]) -> DockGeometry:
-    """Center = midpoint(top, bottom); distances to all lights updated every call."""
+def evaluate_dock_geometry(
+    cores: List[Core],
+    *,
+    lateral_exact_px: float = 8.0,
+    lateral_exact_frac: float = 0.06,
+) -> DockGeometry:
+    """Label four lights and measure both the level-view spread and the pitched-view cues.
+
+    Spread is the old square-on test, taken from the top–bottom midpoint. It is near
+    zero only when the camera is level and the dock is seen straight on. While the
+    camera is pitched, use lateral_px (cross-track) and, when that is near zero, the
+    cross-ratio center instead of the diameter midpoint.
+    """
     if len(cores) < 4:
         return DockGeometry(ok=False, message=f"need 4 lights, got {len(cores)}")
 
@@ -78,17 +166,45 @@ def evaluate_dock_geometry(cores: List[Core]) -> DockGeometry:
 
     top, bottom = labels["top"], labels["bottom"]
     left, right = labels["left"], labels["right"]
-    center = _mid(top, bottom)
+    framed = _line_direction(top, bottom)
+    if framed is None:
+        return DockGeometry(ok=False, message="top and bottom are too close")
+    direction, length = framed
 
-    d_top = _dist(top, center)
-    d_bottom = _dist(bottom, center)
-    d_left = _dist(left, center)
-    d_right = _dist(right, center)
-    radius_tb = 0.5 * _dist(top, bottom)
+    along_l = _along(left, top, direction)
+    along_r = _along(right, top, direction)
+    margin = 0.12 * length
+    if not (-margin <= along_l <= length + margin and -margin <= along_r <= length + margin):
+        return DockGeometry(
+            ok=False,
+            message="side lights are not between top and bottom",
+        )
+
+    diameter_mid = _mid(top, bottom)
+    d_top = _dist(top, diameter_mid)
+    d_bottom = _dist(bottom, diameter_mid)
+    d_left = _dist(left, diameter_mid)
+    d_right = _dist(right, diameter_mid)
+    radius_tb = 0.5 * length
     dists = [d_top, d_bottom, d_left, d_right]
     spread = float(max(dists) - min(dists))
     err_left = d_left - radius_tb
     err_right = d_right - radius_tb
+
+    side_mid = _mid(left, right)
+    lateral_px = _lateral(side_mid, top, direction)
+    along_m = _along(side_mid, top, direction)
+    exact_thr = max(float(lateral_exact_px), float(lateral_exact_frac) * max(radius_tb, 1.0))
+    center_exact = abs(lateral_px) <= exact_thr
+    guidance = diameter_mid
+    obliqueness = 0.0
+    if center_exact:
+        recovered = _cross_ratio_center(top, direction, length, along_m)
+        if recovered is not None:
+            guidance = recovered
+            obliqueness = along_m / length - FRONTAL_FRACTION
+        else:
+            center_exact = False
 
     return DockGeometry(
         ok=True,
@@ -96,7 +212,8 @@ def evaluate_dock_geometry(cores: List[Core]) -> DockGeometry:
         bottom=bottom,
         left=left,
         right=right,
-        center=center,
+        center=guidance,
+        diameter_mid=diameter_mid,
         d_top=d_top,
         d_bottom=d_bottom,
         d_left=d_left,
@@ -105,6 +222,9 @@ def evaluate_dock_geometry(cores: List[Core]) -> DockGeometry:
         spread=spread,
         err_left=err_left,
         err_right=err_right,
+        lateral_px=lateral_px,
+        center_exact=center_exact,
+        obliqueness=obliqueness,
         message="ok",
     )
 
@@ -195,12 +315,20 @@ def draw_dock_geometry(
             cv2.LINE_AA,
         )
 
+    if geo.left is not None and geo.right is not None and geo.top is not None and geo.bottom is not None:
+        side_mid = _mid(geo.left, geo.right)
+        sm = ipt(side_mid)
+        cv2.drawMarker(vis, sm, (255, 128, 0), cv2.MARKER_TILTED_CROSS, 14, 2)
+        cv2.line(vis, sm, c, (255, 128, 0), 1, cv2.LINE_AA)
+
+    exact = "exact" if geo.center_exact else "approx"
     y0 = 52
     lines = [
-        f"center=({geo.center[0]:.0f},{geo.center[1]:.0f})",
+        f"center=({geo.center[0]:.0f},{geo.center[1]:.0f}) {exact}",
         f"r_TB={geo.radius_tb:.1f}  dT={geo.d_top:.1f}  dB={geo.d_bottom:.1f}",
         f"dL={geo.d_left:.1f}  dR={geo.d_right:.1f}",
         f"errL={geo.err_left:+.1f}  errR={geo.err_right:+.1f}  spread={geo.spread:.1f}",
+        f"lateral={geo.lateral_px:+.1f}px  obliqueness={geo.obliqueness:+.3f}",
     ]
     for i, line in enumerate(lines):
         cv2.putText(

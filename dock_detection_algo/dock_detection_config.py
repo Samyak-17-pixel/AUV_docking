@@ -26,7 +26,7 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     p = Path(path) if path else DEFAULT_CONFIG
     with open(p, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    for section in ("camera", "mask", "peaks", "alignment", "hud"):
+    for section in ("camera", "mask", "peaks", "alignment", "hud", "acquire"):
         cfg.setdefault(section, {})
     return cfg
 

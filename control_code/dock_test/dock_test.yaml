@@ -1,0 +1,90 @@
+# Test docking controller for Mako_01.
+#
+# WHAT IT DOES
+#   Reads /Mako_01/dock_align (from dock_detection_algo) and odometry, and publishes
+#   /Mako_01/actuator_cmd. Stop the sim teleop node first: only one program may
+#   publish that topic.
+#
+#   Fewer than four trusted lights: yaw and pitch follow the detector's search
+#   hints. Heave is only the buoyancy trim. Surge is a small forward push when
+#   the fins must yaw, or reverse when the detector says the dock does not fit
+#   in the frame.
+#
+#   Four lights: heave on elevation_rad (positive = dock is deeper). Pitch on
+#   error_y_px only to keep the dock in the image. Yaw on error_x_px and
+#   lateral_px. A small forward surge runs only while that yaw error is outside
+#   the deadband, so the X-fins have flow. When depth, heading and the image
+#   are inside the deadbands, surge is zero. That is the standoff. This node
+#   does not drive into the funnel.
+#
+# SIGNS
+#   Z force + = down. M moment + = nose up. N moment + = bow to starboard.
+#   X force + = forward. Image +x = dock to the right. Image +y = dock below.
+#   elevation_rad + = dock center is below the horizon.
+
+node:
+  name: dock_test
+  rate_hz: 20.0
+  ros_domain_id: 42
+  vessel: Mako_01
+
+topics:
+  odometry: /Mako_01/odometry_sim
+  dock_align: /Mako_01/dock_align
+  actuator_cmd: /Mako_01/actuator_cmd
+
+feedforward:
+  heave_n: 7.25              # N, + = down. Cancels Mako_01's net buoyancy so a
+                             #   "do not heave" search does not float the vehicle.
+                             #   Same number as station_keeping.yaml.
+
+gains:
+  elevation_n_per_rad: 40.0  # Heave force per radian of elevation. 0.1 rad
+                             #   (~6 deg) then asks for 4 N on top of the trim.
+                             #   Raise if depth matching is sluggish. Lower if
+                             #   the heave thrusters hunt.
+  heave_max_n: 25.0          # Cap on the total heave force, including trim.
+  pitch_nm_per_px: 0.04      # Nose-down moment per pixel of dock-below-center.
+                             #   50 px -> 2 N*m. Pitch is differential heave and
+                             #   works at zero speed.
+  pitch_kd: 4.0              # N*m per rad/s of measured pitch rate. Opposes the rate.
+  pitch_max_nm: 4.0          # Leaves heave authority on the same two thrusters.
+  yaw_nm_per_px: 0.03        # Yaw moment per pixel of dock-right-of-center.
+  yaw_nm_per_lateral_px: 0.03 # Same scale for the side-midpoint cue.
+  yaw_kd: 2.0                # N*m per rad/s of yaw rate.
+  yaw_max_nm: 3.0            # Fin yaw moment cap. Needs forward speed to appear.
+  roll_nm_per_rad: 2.0       # Hold roll at zero so the camera stays upright.
+  roll_kd: 1.0
+  roll_max_nm: 2.0
+
+deadband:
+  elevation_rad: 0.02        # ~1 deg. Inside this, heave is trim only.
+  error_y_px: 10.0           # Inside this, no pitch correction.
+  error_x_px: 10.0           # Inside this, error_x does not yaw or request surge.
+  lateral_px: 8.0            # Matches the detector's lateral_exact_px starting point.
+
+limits:
+  flow_surge_n: 4.0          # Axial force while yaw needs fin flow, and the
+                             #   reverse force when the dock is too close.
+                             #   Not a closing speed. 4 N is well under the
+                             #   axial thruster's force at 1800 RPM.
+  too_close_radius_px: 200.0 # Top-bottom half-length above this means the 2 m
+                             #   dock is inside roughly 2.3 m. Surge reverses.
+  rpm_cap: 1800.0
+  fin_deg_cap: 25.0
+  u_fin_min_mps: 0.4
+  u_fin_off_mps: 0.15
+  u_fin_full_mps: 0.5
+
+safety:
+  min_depth_m: 0.4
+  max_depth_m: 20.0
+  max_pitch_deg: 35.0        # Tighter than station keeping: this node pitches
+                             #   on purpose, but it must not keep pitching past
+                             #   the camera's useful view.
+  max_roll_deg: 45.0
+  odom_timeout_s: 0.5
+  dock_timeout_s: 0.5        # No DockAlign for this long -> thrusters and fins to zero.
+
+logging:
+  status_period_s: 2.0

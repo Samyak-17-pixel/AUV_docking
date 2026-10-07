@@ -12,6 +12,7 @@ Publishes interfaces/DockAlign on /<vessel>/dock_align (from camera namespace).
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -25,12 +26,13 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Imu
 from std_msgs.msg import Header
 
+from dock_acquire import PartialAcquire
+from dock_align_msg import align_topic_from_camera, build_dock_align_msg, quat_to_roll_pitch
 from dock_detection_config import DEFAULT_CONFIG, detector_kwargs, load_config
-from dock_align_msg import align_topic_from_camera, build_dock_align_msg
-from dock_geometry import draw_dock_geometry, draw_mask_debug, evaluate_dock_geometry
+from dock_geometry import draw_dock_geometry, draw_mask_debug, evaluate_dock_geometry, unrotate_cores
 from dock_light_mask import bloom_mask_and_cores
 
 DEFAULT_TOPIC = "/Mako_01/camera_03/image/compressed"
@@ -69,11 +71,18 @@ def _draw_align_hud(
         hint_y = "DOWN" if align_msg.error_y_px > deadband_px else (
             "UP" if align_msg.error_y_px < -deadband_px else "Y-OK"
         )
+        lat = "LAT-R" if align_msg.lateral_px > deadband_px else (
+            "LAT-L" if align_msg.lateral_px < -deadband_px else "LAT-OK"
+        )
+        if align_msg.elevation_valid:
+            elev = f"elev={math.degrees(align_msg.elevation_rad):+.1f}deg"
+        else:
+            elev = "elev=no imu"
         color = (0, 255, 0) if abs(align_msg.error_x_px) < ok_px and abs(align_msg.error_y_px) < ok_px else (0, 200, 255)
         cv2.putText(vis, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         cv2.putText(
             vis,
-            f"cmd hint: {hint} / {hint_y}  conf={align_msg.confidence:.2f}",
+            f"cmd hint: {hint} / {hint_y}  {lat}  {elev}  conf={align_msg.confidence:.2f}",
             (8, y + 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -92,25 +101,52 @@ def _draw_align_hud(
             2,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            vis,
+            f"search yaw={align_msg.search_yaw_norm:+.2f}  "
+            f"pitch={align_msg.search_pitch_norm:+.2f}  "
+            f"surge={align_msg.search_surge_norm:+.2f}",
+            (8, y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 128, 255),
+            2,
+            cv2.LINE_AA,
+        )
     return vis
 
 
 class DockLightsLive(Node):
     """Camera subscriber + DockAlign publisher. GUI stays on the main thread."""
 
-    def __init__(self, camera_topic: str, align_topic: str) -> None:
+    def __init__(self, camera_topic: str, align_topic: str, imu_topic: str) -> None:
         super().__init__("dock_lights_live")
         self._lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
         self._msg_count = 0
         self._align_topic = align_topic
+        self._roll_rad = 0.0
+        self._pitch_rad: float | None = None
 
         from interfaces.msg import DockAlign
 
         self.create_subscription(CompressedImage, camera_topic, self._on_image, 10)
+        self.create_subscription(Imu, imu_topic, self._on_imu, 10)
         self._align_pub = self.create_publisher(DockAlign, align_topic, 10)
         self.get_logger().info(f"Camera: {camera_topic}")
+        self.get_logger().info(f"IMU: {imu_topic}")
         self.get_logger().info(f"Publishing DockAlign on {align_topic}")
+
+    def _on_imu(self, msg: Imu) -> None:
+        q = msg.orientation
+        roll, pitch = quat_to_roll_pitch(q.x, q.y, q.z, q.w)
+        with self._lock:
+            self._roll_rad = roll
+            self._pitch_rad = pitch
+
+    def take_attitude(self) -> tuple[float, float | None]:
+        with self._lock:
+            return self._roll_rad, self._pitch_rad
 
     def _on_image(self, msg: CompressedImage) -> None:
         with self._lock:
@@ -146,6 +182,26 @@ def _open_windows(cfg: dict) -> None:
     cv2.waitKey(1)
 
 
+def imu_topic_from_camera(camera_topic: str) -> str:
+    """'/Mako_01/camera_03/image/compressed' → '/Mako_01/imu_01/data'."""
+    parts = camera_topic.strip("/").split("/")
+    if parts:
+        return f"/{parts[0]}/imu_01/data"
+    return "/imu_01/data"
+
+
+def _resplit_cores(bgr: np.ndarray, cores: list, kw: dict) -> list:
+    """If peaks merged, try again at half the separation before moving the vehicle."""
+    if len(cores) >= 4 or not kw.get("peak_mode", True):
+        return cores
+    tighter = dict(kw)
+    tighter["peak_sep"] = max(5, int(kw.get("peak_sep", 28)) // 2)
+    _mask, retry = bloom_mask_and_cores(bgr, **tighter)
+    if len(retry) > len(cores):
+        return retry
+    return cores
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     config_path = DEFAULT_CONFIG
@@ -167,6 +223,7 @@ def main(argv: list[str] | None = None) -> None:
             align_topic = argv[i + 1]
     if not align_topic:
         align_topic = align_topic_from_camera(topic)
+    imu_topic = cfg["camera"].get("imu_topic") or imu_topic_from_camera(topic)
 
     try:
         from interfaces.msg import DockAlign  # noqa: F401
@@ -198,6 +255,20 @@ def main(argv: list[str] | None = None) -> None:
     frac = float(align_cfg.get("spread_align_frac", 0.08))
     min_px = float(align_cfg.get("spread_align_min_px", 8.0))
     conf_base = float(align_cfg.get("confidence_base", 0.4))
+    lateral_exact_px = float(align_cfg.get("lateral_exact_px", 8.0))
+    lateral_exact_frac = float(align_cfg.get("lateral_exact_frac", 0.06))
+    hfov_deg = float(cfg["camera"].get("hfov_deg", 60.0))
+    acq_cfg = cfg.get("acquire", {})
+    acquire = PartialAcquire(
+        edge_frac=float(acq_cfg.get("edge_frac", 0.10)),
+        nod_pitch_deg=float(acq_cfg.get("nod_pitch_deg", 20.0)),
+        yaw_wiggle_deg=float(acq_cfg.get("yaw_wiggle_deg", 8.0)),
+        nod_period_s=float(acq_cfg.get("nod_period_s", 8.0)),
+        backup_radius_frac=float(acq_cfg.get("backup_radius_frac", 0.22)),
+        backup_after_s=float(acq_cfg.get("backup_after_s", 8.0)),
+        hfov_deg=hfov_deg,
+        flow_surge_norm=float(acq_cfg.get("flow_surge_norm", 0.35)),
+    )
     print(
         "Windows: 'Dock camera' + 'Bloom mask'. "
         "error_x>0 => dock RIGHT of center. p = print tuned values, q/Esc to quit.",
@@ -205,7 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     rclpy.init()
-    node = DockLightsLive(topic, align_topic)
+    node = DockLightsLive(topic, align_topic, imu_topic)
     last_count = 0
     last_status_t = time.time()
     saw_frame = False
@@ -247,7 +318,20 @@ def main(argv: list[str] | None = None) -> None:
                         core_pct=core_pct,
                     )
                     mask, cores = bloom_mask_and_cores(bgr, **kw)
-                    geo = evaluate_dock_geometry(cores)
+                    cores = _resplit_cores(bgr, cores, kw)
+                    roll_rad, pitch_rad = node.take_attitude()
+                    h, w = bgr.shape[:2]
+                    leveled = unrotate_cores(cores, roll_rad, 0.5 * w, 0.5 * h)
+                    geo = evaluate_dock_geometry(
+                        leveled,
+                        lateral_exact_px=lateral_exact_px,
+                        lateral_exact_frac=lateral_exact_frac,
+                    )
+                    search = None
+                    if not geo.ok and len(leveled) < 4:
+                        search = acquire.update(leveled, w, h, time.time())
+                    else:
+                        acquire.reset()
 
                     header = Header()
                     header.stamp = node.get_clock().now().to_msg()
@@ -255,17 +339,27 @@ def main(argv: list[str] | None = None) -> None:
                     align_msg = build_dock_align_msg(
                         header=header,
                         geo=geo,
-                        cores=cores,
-                        image_width=bgr.shape[1],
-                        image_height=bgr.shape[0],
+                        cores=leveled,
+                        image_width=w,
+                        image_height=h,
                         spread_align_frac=frac,
                         spread_align_min_px=min_px,
                         confidence_base=conf_base,
+                        pitch_rad=pitch_rad,
+                        hfov_deg=hfov_deg,
+                        acquire=search,
+                        flow_surge_norm=float(acq_cfg.get("flow_surge_norm", 0.35)),
                     )
                     node.publish_align(align_msg)
 
+                    # Show the roll-compensated frame so T/B/L/R markers sit on the lights.
+                    # OpenCV's positive angle is the opposite of our y-down unrotation.
+                    view_angle = -math.degrees(roll_rad)
+                    view_m = cv2.getRotationMatrix2D((0.5 * w, 0.5 * h), view_angle, 1.0)
+                    view = cv2.warpAffine(bgr, view_m, (w, h))
+                    view_mask = cv2.warpAffine(mask, view_m, (w, h), flags=cv2.INTER_NEAREST)
                     cam_vis = draw_dock_geometry(
-                        bgr, geo, len(cores), spread_align_frac=frac, spread_align_min_px=min_px
+                        view, geo, len(leveled), spread_align_frac=frac, spread_align_min_px=min_px
                     )
                     cam_vis = _draw_align_hud(
                         cam_vis,
@@ -273,7 +367,7 @@ def main(argv: list[str] | None = None) -> None:
                         float(hud_cfg.get("hint_deadband_px", 2.0)),
                         float(hud_cfg.get("ok_error_px", 10.0)),
                     )
-                    mask_vis = draw_mask_debug(mask, geo)
+                    mask_vis = draw_mask_debug(view_mask, geo)
 
                     cv2.imshow(WIN_CAM, cam_vis)
                     cv2.imshow(WIN_MASK, mask_vis)

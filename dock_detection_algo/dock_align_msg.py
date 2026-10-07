@@ -8,9 +8,36 @@ from typing import List, Optional, Tuple
 from geometry_msgs.msg import Point
 from std_msgs.msg import Header
 
+from dock_acquire import AcquireCommand, track_surge_norm
 from dock_geometry import DockGeometry
 
 Core = Tuple[float, float]
+
+
+def quat_to_roll_pitch(x: float, y: float, z: float, w: float) -> Tuple[float, float]:
+    """ZYX roll and pitch [rad], same convention as control_code/common/state.py.
+
+    Positive pitch is nose up. Positive roll is starboard down.
+    """
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    return roll, pitch
+
+
+def focal_length_px(image_width: int, hfov_deg: float) -> float:
+    """Pinhole fx=fy from horizontal field of view and image width."""
+    half = max(math.radians(hfov_deg) * 0.5, 1e-3)
+    return (0.5 * float(image_width)) / math.tan(half)
+
+
+def elevation_down_rad(dock_cy: float, cy_img: float, fy: float, pitch_rad: float) -> float:
+    """Angle of the dock center below the horizon [rad].
+
+    Positive means the dock is deeper than the camera, so heave should go down.
+    Pixel y grows downward, and pitch_rad is nose-up, so a nose-up camera looking
+    straight at the dock reports a negative elevation (heave up).
+    """
+    return math.atan((dock_cy - cy_img) / max(fy, 1.0)) - pitch_rad
 
 
 def align_topic_from_camera(camera_topic: str) -> str:
@@ -41,6 +68,10 @@ def build_dock_align_msg(
     spread_align_frac: float = 0.08,
     spread_align_min_px: float = 8.0,
     confidence_base: float = 0.4,
+    pitch_rad: Optional[float] = None,
+    hfov_deg: float = 60.0,
+    acquire: Optional[AcquireCommand] = None,
+    flow_surge_norm: float = 0.35,
 ):
     """Fill a DockAlign message. Import interfaces.msg.DockAlign at call site after sourcing ws."""
     from interfaces.msg import DockAlign
@@ -50,6 +81,10 @@ def build_dock_align_msg(
     msg.num_lights = int(len(cores))
     msg.image_width = int(image_width)
     msg.image_height = int(image_height)
+    if acquire is not None:
+        msg.search_yaw_norm = float(acquire.yaw_norm)
+        msg.search_pitch_norm = float(acquire.pitch_norm)
+        msg.search_surge_norm = float(acquire.surge_norm)
 
     cx_img = 0.5 * float(image_width)
     cy_img = 0.5 * float(image_height)
@@ -58,9 +93,13 @@ def build_dock_align_msg(
 
     if not geo.ok or geo.center is None:
         msg.valid = False
-        msg.status = geo.message or "invalid"
+        if acquire is not None and acquire.status and acquire.status != "have_four":
+            msg.status = acquire.status
+        else:
+            msg.status = geo.message or "invalid"
         msg.confidence = min(1.0, msg.num_lights / 4.0) * 0.25
         msg.aligned = False
+        msg.elevation_valid = False
         return msg
 
     dock_cx, dock_cy = geo.center
@@ -93,6 +132,28 @@ def build_dock_align_msg(
     msg.err_right_px = float(geo.err_right)
     msg.aligned = bool(aligned)
     msg.diameter_angle_deg = float(diameter_angle_deg)
+    msg.center_exact = bool(geo.center_exact)
+    msg.lateral_px = float(geo.lateral_px)
+    msg.obliqueness = float(geo.obliqueness)
+    if pitch_rad is None:
+        msg.elevation_valid = False
+        msg.elevation_rad = 0.0
+    else:
+        fy = focal_length_px(image_width, hfov_deg)
+        msg.elevation_rad = float(elevation_down_rad(dock_cy, cy_img, fy, pitch_rad))
+        msg.elevation_valid = True
+    msg.search_yaw_norm = 0.0
+    msg.search_pitch_norm = 0.0
+    msg.search_surge_norm = float(
+        track_surge_norm(
+            geo.lateral_px,
+            diameter_angle_deg,
+            err_x,
+            lateral_ok_px=max(spread_align_min_px, 8.0),
+            error_x_ok_px=max(spread_align_min_px, 10.0),
+            flow_surge_norm=flow_surge_norm,
+        )
+    )
     msg.center = _point(geo.center)
     msg.top = _point(geo.top)
     msg.bottom = _point(geo.bottom)
