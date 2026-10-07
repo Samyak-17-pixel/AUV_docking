@@ -1,7 +1,7 @@
 # Execution guide — AUV docking (Mako_01)
 
 Step-by-step instructions for every task. Each task says **which terminal**, **what to type**, **what you should see**, and
-**what to do if you do not**. Last updated 2026-10-01.
+**what to do if you do not**. Last updated 2026-10-08.
 
 Paths are written from the home directory. `AUV` below means `~/Research/MAVSIM/AUV_docking`.
 
@@ -18,7 +18,8 @@ Paths are written from the home directory. `AUV` below means `~/Research/MAVSIM/
 | Follow waypoints | [6](#6-task-waypoint-tracking) |
 | Test each degree of freedom / check actuator signs | [7](#7-task-per-dof-tests-actuator-allocation) |
 | Hold position (hover) | [8](#8-task-station-keeping-hover) |
-| Detect the dock lights | [9](#9-task-dock-light-detection) |
+| Detect the dock lights, including a pitched view | [9](#9-task-dock-light-detection) |
+| Hold a standoff on the dock (match depth, square up, do not enter) | [15](#15-task-dock-standoff-controller) |
 | Run everything with no simulator | [10](#10-task-offline-mode-no-simulator) |
 | Run the unit tests | [11](#11-task-unit-tests) |
 | Do a full docking run | [12](#12-full-docking-run-order) |
@@ -28,7 +29,7 @@ Paths are written from the home directory. `AUV` below means `~/Research/MAVSIM/
 - Commands to the vehicle are thruster **RPM** (`th_XX`) and fin **degrees** (`cs_XX`), 0 = stop. Not PWM.
 - Both heave thrusters point **UP**: positive RPM = up, so **diving = negative RPM** (already handled, `heave_sign: -1`).
 - Depth is NED metres, **positive = deeper**. The vehicle starts at (x 0, y 0, depth 3 m); the dock is at (10, 0, 3).
-- Run **only one controller at a time** (depth, waypoint, DOF test, station keeping). They all publish on the same topic.
+- Run **only one controller at a time** (depth, waypoint, DOF test, station keeping, dock standoff). They all publish on the same topic. The dock detector does **not** publish actuator commands; it can run next to a controller.
 - Edit the **YAML** next to a script to change its behaviour. Do not edit the Python.
 
 ---
@@ -62,6 +63,8 @@ If you get `Unknown package 'interfaces'`, the third line is missing or the work
 ## 2. One-time setup
 
 ### 2.1 Build the ROS messages (only if `control_code/ws/install` does not exist, or the `.msg` files changed)
+
+`DockAlign.msg` gained the pitched-view fields (`lateral_px`, `elevation_rad`, `search_*`, and the rest listed in section 9.6). If the detector or the standoff controller fails with a missing field, rebuild:
 ```bash
 cd ~/Research/MAVSIM/AUV_docking/control_code/ws
 source /opt/ros/humble/setup.bash
@@ -307,9 +310,13 @@ cd ~/Research/MAVSIM/AUV_docking/dock_detection_algo
 ./echo_align.sh              # stream /Mako_01/dock_align (Ctrl-C to stop)
 ./echo_align.sh --once       # one message
 ```
-- `valid: true` needs all 4 lights found.
-- `error_x_px > 0`: dock is to the **right** of the image center. `error_y_px > 0`: dock is **below** center.
-- `aligned: true`: the dock is seen square-on. `confidence` is 0 to 1.
+- `valid: true` needs all 4 lights labelled, with both side lights between top and bottom.
+- `error_x_px > 0`: dock center is to the **right** of the image center.
+- `error_y_px > 0`: dock center is **below** the image center. That is the pitch cue (keep it in frame), not the dive cue.
+- `aligned: true` and `spread_px` near 0: the camera is **level** and the dock is seen square-on. A pitched camera turns the light circle into an ellipse, so `spread_px` grows even when the heading is already right. Do not treat that as a failed heading.
+- `confidence` is 0 to 1.
+
+The detector also subscribes to `/Mako_01/imu_01/data`. It removes roll before labelling, and it uses pitch to compute `elevation_rad`. The two windows show the roll-compensated image, so the T/B/L/R markers sit on the lights. The new fields are listed in section 9.6.
 
 ### 9.4 Tune the detector
 1. Run `./run_live.sh` with the dock in view.
@@ -324,13 +331,40 @@ cd ~/Research/MAVSIM/AUV_docking/dock_detection_algo
 | `cores` < 4, lights merged | raise `peaks.core_pct`; lower `peaks.peak_sep`; lower `mask.close_k` |
 | `cores` > 4, spurious blobs | raise `mask.v_thresh`; raise `peaks.response_min`; raise `peaks.peak_sep` |
 | Centers jitter | raise `peaks.dog_sigma_small`; raise `peaks.refine_half_window` |
-| Never `aligned` | raise `alignment.spread_align_frac` or `spread_align_min_px` |
+| Never `aligned` while the camera is level and square | raise `alignment.spread_align_frac` or `spread_align_min_px` |
+| Never `aligned` while pitched up or down at the dock | Expected. `spread_px` is the level, square-on check. See section 9.6 |
 
 ### 9.5 Optional: via ROS launch
 ```bash
 cd ~/Research/MAVSIM/AUV_docking/dock_detection_algo
 ros2 launch dock_detection_algo_launch.py topic:=/Mako_01/camera_03/image/compressed config:=$PWD/dock_detection.yaml
 ```
+
+### 9.6 Fields added for a pitched view and a partial detection
+
+The four lights sit on a 1 m circle. Top and bottom are a vertical diameter. The two side lights are both above the center, at 45° from the top. They are the same color, so a missing light is not identified by color.
+
+| Field | What it means | What a controller should do |
+|---|---|---|
+| `center_exact` | true when the side-light midpoint lies on the top–bottom line, so `center` is the cross-ratio dock center | If false, `center` is only the top–bottom midpoint |
+| `lateral_px` | side midpoint to the **right** of the top–bottom line, in pixels. Near 0 when the heading is perpendicular to the dock, even if the vehicle is shifted sideways | Yaw. A pure sideways shift with a perpendicular heading shows up in `error_x_px` instead |
+| `elevation_rad` | dock center **below the horizon**, radians. Positive = dock is deeper | Heave down. This is the depth command |
+| `elevation_valid` | an IMU pitch sample has arrived | If false, do not heave from elevation |
+| `obliqueness` | how foreshortened the diameter is. Zero when the camera is level, any depth | A check only. Not a heave or pitch command |
+| `search_yaw_norm` | +1 = yaw toward image right. Published only while `valid` is false | Yaw. Needs forward speed so the fins work |
+| `search_pitch_norm` | +1 = pitch down. Published only while `valid` is false | Pitch with the heave thrusters |
+| `search_surge_norm` | about +0.35 when a yaw needs fin flow; −1 when the dock is too close to fit in the frame | Axial thruster. There is no sway thruster |
+
+While fewer than four lights are trusted, `valid` is false and the detector does not publish a depth command. It first retries peak finding at half `peak_sep` (merged bloom). Then it yaws or pitches toward an edge light, nods about ±20° if the lights are inside the frame, or asks for reverse thrust if the 2 m dock cannot fit in the camera (inside about 2.3 m).
+
+### 9.7 Check the geometry without the simulator
+
+No ROS:
+```bash
+cd ~/Research/MAVSIM/AUV_docking/dock_detection_algo
+python3 test_pitched_geometry.py
+```
+Expected: `10 tests passed`. These project the real 1 m light circle through a pinhole camera (level, deep, pitched, offset, yawed, rolled) and check the search commands.
 
 ---
 
@@ -369,6 +403,13 @@ Expected: `37 passed` in about 3 s. They check allocation signs (heave thrusters
 offline vehicle, a wrong-sign actuator being caught, and station keeping (still water, vertical push, current, low `rpm_cap`,
 no-flow heading, safety trips).
 
+The dock work has its own scripts, also with no ROS:
+```bash
+cd ~/Research/MAVSIM/AUV_docking/dock_detection_algo && python3 test_pitched_geometry.py
+cd ~/Research/MAVSIM/AUV_docking/control_code/dock_test && python3 test_dock_test_core.py
+```
+Expected: `10 tests passed`, then `8 tests passed`.
+
 ---
 
 ## 12. Full docking run (order)
@@ -376,12 +417,10 @@ no-flow heading, safety trips).
 1. Terminal 1: `./start.sh` in `mavsim-controller`, start the Mako_01 session (section 3.1).
 2. Any terminal: stop teleop (3.4).
 3. Terminal 2: pass the DOF tests (section 7).
-4. Terminal 3: `./run_live.sh` (detector, section 9.2).
-5. Terminal 4: `./echo_align.sh` and confirm `valid: true`.
-6. Terminal 2: depth hold (5) or waypoint tracking (6) to bring the vehicle in front of the dock, then station keeping (8).
-
-There is **no node yet that consumes `DockAlign` and commands the actuators**: perception and control are separate, so the last
-approach is manual or still to be written.
+4. Terminal 3: `./run_live.sh` (detector, section 9.2). Leave it running.
+5. Terminal 4: `./echo_align.sh` and confirm messages are arriving. `valid: true` means four lights. `valid: false` is the search (section 9.6).
+6. Optional: depth hold (5) or waypoint tracking (6) to bring the vehicle in front of the dock. Stop that controller before the next step. Only one program may publish `/Mako_01/actuator_cmd`.
+7. Terminal 2: the standoff controller (section 15). It matches depth, squares the heading, keeps the dock in frame, then holds. It does **not** drive into the funnel.
 
 ---
 
@@ -419,3 +458,64 @@ approach is manual or still to be written.
 | Detector: no GUI windows | `echo $DISPLAY` must be set (e.g. `export DISPLAY=:0`); install `opencv-python`, not the headless build. |
 | `ModuleNotFoundError: yaml` | `pip install pyyaml`. |
 | Bridge has no camera images | The MAVSim frontend is not reachable: `./start.sh --frontend-url http://<host>:5173`. |
+| `DockAlign` has no `elevation_rad` or `search_yaw_norm` | The message file changed. Rebuild `interfaces` (section 2.1) and open a new terminal so it sources `install/setup.bash`. |
+| Detector windows show lights but `elevation_valid: false` | `/Mako_01/imu_01/data` is not arriving. Check `ros2 topic echo /Mako_01/imu_01/data --once`. Do not heave until it is true. |
+| `spread_px` stays large while looking up or down at the dock | Expected. A pitched camera sees an ellipse. Use `elevation_rad` for depth and `lateral_px` / `error_x_px` for heading. `aligned` becomes true again after the vehicle is level and square. |
+| Dock test `dock_align stale -> neutral` | The detector is not running, or this terminal is not on `ROS_DOMAIN_ID=42`. Start section 9.2 first. |
+| Dock test vehicle yaws but does not turn | The fins need forward speed. `mode=creep` or `mode=search` should show `X` around `+4 N`. If `u` stays near 0, the axial thruster is not producing flow (teleop still publishing zeros, or the session is paused). |
+| Dock test dives or climbs the wrong way | Positive `elevation_rad` must dive. Watch one log line: `Z` positive is a downward force. If the vehicle goes the other way, stop it (section 13) and check the heave sign with section 7 before trying again. |
+| Dock test `SAFETY TRIP` on pitch | Pitch passed 35°. The node exits and publishes zeros. Lower `gains.pitch_nm_per_px` in `dock_test.yaml` if it pitches too hard. |
+
+---
+
+## 15. Task: dock standoff controller
+
+Reads `/Mako_01/dock_align` and publishes real thruster RPM and fin degrees. It tries to end **stopped**, at the dock's depth, with the heading square and the dock in the middle of the image. It does not keep driving into the funnel.
+
+Gains and limits: `AUV/control_code/dock_test/dock_test.yaml`. They are starting values, not yet tuned on the simulator. Watch the first run.
+
+### 15.1 Before you start
+1. Sections 1 and 3: simulator playing, teleop stopped (3.4).
+2. Section 2.1 if you have not rebuilt `interfaces` since `DockAlign.msg` changed.
+3. Terminal 3: detector running (`./run_live.sh`, section 9.2). Leave it running. It does not publish actuator commands.
+4. Stop depth hold, waypoint tracking, and station keeping. This node uses the same actuator topic.
+
+### 15.2 Run it — Terminal 2
+```bash
+cd ~/Research/MAVSIM/AUV_docking/control_code/dock_test
+./run_dock_test.sh
+```
+The script sources ROS and the workspace, sets `ROS_DOMAIN_ID` to 42 if you have not set it, and prints a reminder to stop teleop.
+
+### 15.3 What you should see
+A status line every 2 seconds:
+```text
+mode=creep  X=+4.0 N  Z=+11.2 N  M=-1.20  N=+0.80  u=0.35 m/s
+```
+`X` is axial force (positive = forward). `Z` is heave force (positive = down). `M` is pitch moment (positive = nose up). `N` is yaw moment (positive = bow to starboard). `u` is forward speed.
+
+| `mode` | The vehicle is doing this |
+|---|---|
+| `search` | Fewer than four lights. Yaw and pitch follow the detector search. Heave is only the 7.25 N buoyancy trim, so depth does not change from a partial view. `X` is about `+4 N` when the fins must yaw, or about `−4 N` when the dock is too close to fit in the camera. |
+| `creep` | Four lights, but the dock is still left/right in the image or the heading is not square. A small forward push (`X` about `+4 N`) gives the fins flow. Heave follows `elevation_rad`. Pitch follows `error_y_px` only to keep the dock in frame. |
+| `standoff` | Depth, heading, and the image are inside the deadbands (about 1° of elevation, 10 px left/right, 10 px up/down, 8 px on the side-light cue). `X` is 0. The vehicle holds. It does not enter the funnel. |
+| `backup` | Four lights and the top–bottom radius is above 200 px (dock inside roughly 2.3 m). `X` is about `−4 N`. |
+
+Ctrl-C publishes zeros and exits.
+
+### 15.4 What it will not do
+- It will not strafe. There is no sway thruster. A sideways offset is corrected by yawing and moving forward (`mode=creep`), then stopping.
+- It will not heave while `valid` is false or `elevation_valid` is false.
+- It will not keep a closing speed after the standoff deadbands are met.
+- Yaw does nothing useful if `u` stays near 0. The fins need flow.
+
+### 15.5 Check the commands without moving the vehicle
+No ROS:
+```bash
+cd ~/Research/MAVSIM/AUV_docking/control_code/dock_test
+python3 test_dock_test_core.py
+```
+Expected: `8 tests passed`.
+
+### 15.6 If it misbehaves
+Stop it with Ctrl-C, or force zeros (section 13). Then see the dock-test rows in section 14. To make the first run gentler, lower `gains.elevation_n_per_rad`, `gains.pitch_nm_per_px`, and `gains.yaw_nm_per_px` in `dock_test.yaml`, and restart. Change one at a time.
