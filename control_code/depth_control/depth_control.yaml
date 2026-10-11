@@ -50,8 +50,8 @@ limits:
   rpm_max: 2668.0
   fin_deg_max: 35.0
   # Soft command caps (must be <= the hardware limits above)
-  rpm_cap: 1000.0   # NOTE: marginal for this vehicle. Net buoyancy is +7.25 N and (assumed thrust law) both heave
-                    # thrusters give only ~7 N at 1000 RPM, so there is almost no margin to dive. See station_keeping.yaml (1800).
+  rpm_cap: 1000.0   # ~7 N total heave thrust at 1000 RPM (assumed thrust law). The vehicle is neutrally buoyant, so this is enough
+                    # for gentle depth changes; station_keeping.yaml uses 1800 for disturbance margin.
   fin_deg_cap: 25.0
   # Hold surge / fins at zero while depth controlling
   surge_rpm: 0.0

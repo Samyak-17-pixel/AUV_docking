@@ -28,8 +28,12 @@ topics:
 # Hard command caps applied by the allocator (hardware: +-2668 RPM, +-35 deg).
 limits:
   # With the assumed thrust law (see common/mako_geometry.yaml, rpm_to_rps) the two heave thrusters give about
-  # 7 N TOTAL at 1000 RPM, but the vehicle floats up with 7.25 N net buoyancy => at 1000 RPM it can barely hold depth.
-  # 1800 RPM gives ~23 N. Raise only if the logs show saturation; lower for gentler first tests.
+  # 7 N TOTAL at 1000 RPM and ~23 N at 1800 RPM. The vehicle is neutrally buoyant (20 kg), so 7 N is already
+  # 0.35 m/s^2 of heave acceleration. Raise only if the logs show saturation; lower for gentler first tests.
+  small_force_n: 0.3         # [N] Below this thrust the force-to-RPM map is a straight line instead of a square root. Thrust grows with RPM squared, so the exact inverse (RPM ~ sqrt(force))
+                             #   has an INFINITE slope at zero: a +-0.5 N flicker in the demand (sensor noise x gain) becomes a +-370 RPM flip of the propeller. With 0.3 N a flicker of
+                             #   +-0.3 N is only +-110 RPM. MEASURED (heave/pitch hold, noisy odometry): 0 -> chatter 380-560 RPM peak-to-peak, 0.3 -> 100-250 RPM. The price: for a demand
+                             #   below 0.3 N the thruster delivers a bit less than asked (F^2/0.3), which the feedback loops simply see as a softer gain near zero.
   rpm_cap: 1800.0
   fin_deg_cap: 25.0
   # Fin gain scheduling (force ~ U^2): below u_fin_off the fins are switched off, fully on above u_fin_full.
@@ -54,7 +58,8 @@ step:
   # just winds it up until the safety limit trips.
   duration_s: {surge: 6.0, heave: 6.0, pitch: 2.0, yaw: 6.0, roll: 1.5, sway: 6.0}
   surge_n: 6.0             # X [N]
-  heave_n: 12.0            # Z [N], + = down. Must beat the +7.25 N net buoyancy or the vehicle still rises.
+  heave_n: 6.0             # Z [N], + = down. Neutral 20 kg vehicle: ~0.3 m/s^2, about 1 m/s after 3 s (it keeps speeding up:
+                           # drag is tiny). Keep it small, and the test short, so the vehicle stays above the depth limit.
   pitch_nm: 0.5            # M [N*m], + = nose up (2 s pulse -> about 15 deg, 0.3 rad/s)
   yaw_nm: 0.8              # N [N*m], + = bow to starboard (at cruise speed)
   roll_nm: 0.02            # K [N*m] (roll inertia is tiny, ~0.06 kg*m^2: 1.5 s pulse -> about 20 deg)
@@ -78,9 +83,9 @@ tolerance: {surge_m: 0.3, heave_m: 0.15, pitch_deg: 3.0, yaw_deg: 5.0, roll_deg:
 # own loops (below) in every test except when they are the DOF under test.
 background:
   hold_depth_and_pitch: true
-  # Net buoyancy feed-forward [N down]: the vehicle floats up with 7.25 N (Mako_01.mavsim). The loop
-  # adds this so the integrator does not have to wind up. Set 0 to see the raw integral-only behaviour.
-  heave_ff_n: 7.25
+  # Net buoyancy feed-forward [N down]. 0 for the current vessel ("Mako (1).mavsim": 20 kg mass = 20 kg buoyancy => neutral).
+  # The old file (10 kg / 10.74 kg) needed 7.25. A wrong value sinks or floats the vehicle during every test.
+  heave_ff_n: 0.0
 
 safety:
   min_depth_m: 0.4         # abort + neutral if shallower than this (surface = 0)
@@ -88,18 +93,48 @@ safety:
   max_pitch_deg: 60.0
   max_roll_deg: 60.0
 
+# RE-TUNED 2026-10-10 (control_code/tuning/loop_tuner.py) against the offline vehicle with REALISTIC odometry (4.5 Hz, 0.25 s late, noise, freezes) on four plants
+# (nominal, heavy+late, light+fast, stress), through the pose filter (common/pose_filter.py, see `estimator:` below). Changes: heave/pitch/yaw gains much softer, an
+# output low-pass `lpf_tau_s` on heave/pitch/yaw (a first-order filter on the loop output: noise no longer becomes thruster/fin chatter), a setpoint filter `sp_tau_s`
+# on the speed loop, and the ROLL gains cut 5x (the old 0.5/0.2 oscillated: fins swung 15-40 deg and roll overshot 50-190% with realistic odometry).
+# MEASURED effect of changing each number by 0.5x..2x (nominal plant; overshoot / settle / chatter) is quoted in station_keeping.yaml for heave, pitch and yaw; for the rest:
+#   roll.kp 0.1033: x0.5 -> overshoot 4%, settle 4 s, fin swing 1.0 deg | x0.75 -> overshoot 3%, settle 3 s, fin swing 1.1 deg | x1 (this) -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x1.5 -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x2.0 -> overshoot 7%, settle 1 s, fin swing 1.1 deg
+#   roll.kd 0.125: x0.5 -> overshoot 19%, settle 2 s, fin swing 1.1 deg | x0.75 -> overshoot 8%, settle 2 s, fin swing 1.1 deg | x1 (this) -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x1.5 -> overshoot 3%, settle 3 s, fin swing 1.1 deg | x2.0 -> overshoot 3%, settle 4 s, fin swing 1.1 deg
+#   roll.ki 0.0004: x0.5 -> overshoot 2%, settle 2 s, fin swing 1.1 deg | x0.75 -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x1 (this) -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x1.5 -> overshoot 3%, settle 2 s, fin swing 1.1 deg | x2.0 -> overshoot 3%, settle 2 s, fin swing 1.1 deg
+#   speed.kp 25: x0.5 -> overshoot 3%, settle 4 s | x0.75 -> overshoot 1%, settle 4 s | x1 (this) -> overshoot 1%, settle 5 s | x1.5 -> overshoot 2%, settle 6 s | x2.0 -> overshoot 2%, settle 8 s
+#   speed.ki 4: x0.5 -> overshoot 1%, settle 8 s | x0.75 -> overshoot 1%, settle 6 s | x1 (this) -> overshoot 1%, settle 5 s | x1.5 -> overshoot 1%, settle 4 s | x2.0 -> overshoot 2%, settle 3 s
+# Result: yaw, roll and speed pass on all four plants (overshoot < 10%, fin swing < 6 deg). Heave/pitch: steady pushes are rejected (see station_keeping.yaml), chatter 190-250 RPM,
+# a depth step overshoots ~25% (10 cm per 0.4 m). The STRESS plant (thruster lag 0.45 s, odometry 0.5 s late, 1.8x inertia) stays stable but chatters ~430 RPM.
 # PID gains. Output units: heave/surge/speed [N], pitch/yaw/roll [N*m]. Error = setpoint - measurement;
 # the D term uses the measured RATE (depth rate, pitch rate q, yaw rate r, ...), not the error derivative.
 # These start values come from the OFFLINE model (sim_offline/); expect to retune on the real sim.
 gains:
-  heave:  {kp: 60.0, ki: 0.5, kd: 60.0, i_max: 8.0,  max: 25.0}   # N per m, N per m*s, N per m/s
-  pitch:  {kp: 6.0,  ki: 0.3, kd: 5.0,  i_max: 2.0,  max: 4.0}    # N*m per rad, ...
+  heave:  {i_max: 10, kd: 25, ki: 0.5, kp: 6.8, lpf_tau_s: 1.1, max: 25, sp_tau_s: 3}   # N per m, N per m*s, N per m/s
+  pitch:  {i_max: 1.5, kd: 6, ki: 0.01, kp: 1.925, lpf_tau_s: 0.36, max: 4, sp_tau_s: 3}    # N*m per rad, ...
   surge:  {kp: 8.0,  ki: 0.3, kd: 25.0, i_max: 4.0,  max: 20.0}   # N per m, N per m*s, N per m/s
-  speed:  {kp: 25.0, ki: 6.0, kd: 0.0,  i_max: 15.0, max: 30.0}   # N per m/s forward-speed error
-  yaw:    {kp: 3.0,  ki: 0.1, kd: 3.0,  i_max: 0.5,  max: 3.0}    # N*m per rad
-  roll:   {kp: 0.5,  ki: 0.02, kd: 0.2, i_max: 0.1,  max: 0.5}    # N*m per rad
+  speed:  {i_max: 15, kd: 0, ki: 4, kp: 25, max: 30, sp_tau_s: 1.5}   # N per m/s forward-speed error
+  yaw:    {i_max: 0.5, kd: 3.6, ki: 0.0001, kp: 3, lpf_tau_s: 0.2, max: 3}    # N*m per rad
+  roll:   {i_max: 0.1, kd: 0.125, ki: 0.0004, kp: 0.1033, max: 0.5}    # N*m per rad
   cross_track: {kp: 0.35, ki: 0.0, kd: 0.0, i_max: 0.0, max_heading_deg: 30.0}   # rad of heading offset per m
 
 logging:
-  dir: ~/dof_testing_logs  # one CSV per run
+  dir: logs/dof_testing  # one CSV per run
   status_period_s: 2.0
+
+# ---------------------------------------------------------------------------
+# STATE ESTIMATOR  (common/pose_filter.py): turns the slow, late, noisy odometry into a smooth state at the control rate
+# ---------------------------------------------------------------------------
+# The real sim's odometry arrives at ~4.5 Hz, ~0.25 s old, and (offline, with `fake_vehicle.py --realistic`) noisy. Feeding the loops the raw samples turns every sample's
+# noise into a step in the command: 1.5 cm of depth noise times a gain of 60 N/m is a 0.9 N flick, which the thruster map turns into hundreds of RPM.
+# The filter keeps a motion model in the loop (one small Kalman filter per axis) and predicts smoothly between samples. Analogy: reading a speedometer that only
+# updates four times a second and is a quarter-second late: you do not jump at each new reading, you keep a running picture of where the car is.
+# Measured offline (4.5 Hz, 0.25 s, 1.5 cm / 0.2 deg noise): depth RMS error 0.8 cm, forward speed 1.4 cm/s.
+estimator:
+  filter: true               # false = use the raw odometry like before (the old behaviour). Turn off only to compare.
+  odom_latency_s: 0.25       # how old a sample is when it arrives (ASSUMED; measure it on the real sim by comparing a step of thrust with the first odometry reaction).
+                             #   Too small: the vehicle is predicted slightly behind where it is -> more overshoot. Too large: predicted ahead -> a little chatter.
+                             #   +-0.1 s changes the predicted position by v*0.1 (5 cm at 0.5 m/s); only matters for fast manoeuvres.
+  accel_noise_lin: 0.25      # [m/s^2] how fast the vehicle may change speed (process noise). Higher = trusts new samples more (follows faster, noisier). 0.5 N-ish thrust / 20 kg = 0.5.
+  accel_noise_ang: 0.8       # [rad/s^2] the same for roll/pitch/yaw.
+  pos_sigma_m: 0.015         # assumed noise of a position sample. Higher = smoother and slower to react.
+  ang_sigma_rad: 0.0044      # assumed noise of an angle sample (0.25 deg).

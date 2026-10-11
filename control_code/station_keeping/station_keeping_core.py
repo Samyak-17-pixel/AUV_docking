@@ -37,6 +37,7 @@ class StationKeeper:
         self.alloc = alloc or Allocator(
             rpm_cap=lim["rpm_cap"], fin_deg_cap=lim["fin_deg_cap"],
             u_fin_min=lim["u_fin_min_mps"], u_fin_off=lim["u_fin_off_mps"], u_fin_full=lim["u_fin_full_mps"],
+            small_force_n=lim.get("small_force_n", 0.0),
         )
         g = {k: v for k, v in cfg["gains"].items()}
         self.loops = HoldLoops(g, heave_ff_n=cfg["feedforward"]["heave_n"])
@@ -152,6 +153,15 @@ class StationKeeper:
             res[k] = prev + float(np.clip(v - prev, -step, step))
         self._prev_out = res
         return res
+
+    def debug(self) -> Dict[str, Any]:
+        """Setpoints for the viewer's plots (published on ctrl_debug). Empty until the hold point is captured."""
+        if self.sp is None:
+            return {}
+        return {
+            "ctrl": "station_keeping", "mode": "hold",
+            "depth_sp": float(self.sp["depth"]), "pitch_sp_deg": math.degrees(self.sp["pitch"]), "yaw_sp_deg": math.degrees(self.sp["yaw"]),
+        }
 
     def capture_command(self) -> Dict[str, float]:
         """Command while the hold point is still being averaged: only the buoyancy trim, so the vehicle does

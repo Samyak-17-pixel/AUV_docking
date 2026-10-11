@@ -15,6 +15,11 @@
 #   positive RPM pushes UP and a dive needs NEGATIVE RPM (the allocator handles this; you never set it here).
 #   Forces in N, moments in N*m, angles in degrees in THIS file, angles in rad/s inside the loops.
 #
+# RE-MEASURED 2026-10-08 on the offline model of the CURRENT vessel ("Mako (1).mavsim": 20 kg, neutrally buoyant) with the gains
+#   below: heave 1 m step 1.9% overshoot, 4.0 s settle | pitch 10 deg step 16% overshoot, 8.2 s | surge 1 m step 9.8%, slow tail
+#   (30 s to settle within 5%) | heading 30 deg at 1 m/s 10.8%, 8.6 s. The per-parameter sweep numbers further down were measured on
+#   the OLD 10 kg / +7.25 N model: trust their direction and relative size, not the exact values.
+#
 # HOW TO READ THE EFFECT NOTES (important)
 #   The numbers like "overshoot 4.5%, settles in 6.5 s" were MEASURED on the OFFLINE vehicle model
 #   (control_code/sim_offline) with this vehicle's mass/inertia/buoyancy from Mako_01.mavsim and ASSUMED
@@ -71,39 +76,70 @@ enable:                      # switch loops on/off while commissioning. A disabl
 #   max   = cap on this loop's total output (N or N*m) before it goes to the allocator.
 # ---------------------------------------------------------------------------
 gains:
-  heave:                     # depth hold -> Z force [N, + = down]
-    kp: 60.0                 # N per metre of depth error.
-                             #   MEASURED (1 m dive): kp 15 -> overshoot 11.6%, never settles in 40 s (too soft);
-                             #   30 -> 4.5%, 6.5 s;  60 -> 1.9%, 4.4 s;  120 -> 1.0%, 3.6 s.
-                             #   A change of about 2x is a considerable change. Higher is stiffer but it hits
-                             #   the `max` cap sooner: at kp 60 the 25 N cap is reached at 0.42 m error.
-                             #   Lowering kp is the first thing to try if the thrusters buzz.
-    ki: 0.5                  # N per (m*s). Mostly redundant here because the feed-forward already cancels buoyancy.
-                             #   MEASURED: ki 0 -> 0% overshoot, 4.7 s;  0.5 -> 1.9%, 4.4 s;  2 -> 6.9%, 18 s;
-                             #   8 -> 11.2%, 12.6 s. Analogy: the helper leaning too long on the rope yanks you
-                             #   past the target. Raise only if a steady current leaves a permanent offset.
-    kd: 60.0                 # N per (m/s). MEASURED: kd 0 -> 11% overshoot, 39 s (rings like a spring);
-                             #   15 -> 6.4%;  30 -> 3.1%, 3.7 s;  60 -> 1.9%, 4.4 s;  120 -> 2.2%, 6.5 s (too
-                             #   syrupy). A sweet spot is about kp (numerically). If depth readout is noisy,
-                             #   lower kd first: the derivative amplifies noise.
-    i_max: 8.0               # N. Cap on the integral contribution. About the size of the 7.25 N buoyancy:
-                             #   large enough to trim it out, small enough to prevent a long wind-up.
-    max: 25.0                # N. Total heave force cap. The two thrusters can give about 23 N at 1800 RPM
-                             #   (assumed thrust law); asking for more just saturates.
-  pitch:                     # pitch hold -> M moment [N*m, + = nose up] by differential heave thrust
-    kp: 6.0                  # N*m per rad (about 0.105 N*m per degree).
-                             #   MEASURED (10 deg step): kp 1.5 -> 31% overshoot, 18 s;  3 -> 14%, 17 s;
-                             #   6 -> 5.2%, 5.5 s;  12 -> 11%, 2.1 s;  24 -> 32%, oscillating 39 s.
-                             #   Analogy: balancing a plank on a pivot — too weak and it flops around, too
-                             #   stiff and the thruster lag makes you over-correct. There is NO righting moment
-                             #   on this vehicle (CG == CB), so nothing but this loop keeps it level.
-    ki: 0.3
-    kd: 5.0                  # N*m per (rad/s). MEASURED: kd 0 -> unstable (55% overshoot, never settles);
-                             #   1.25 -> 36%;  2.5 -> 21%, 6.3 s;  5 -> 5.2%, 5.5 s;  10 -> 7%, 16.8 s.
-                             #   Never set kd to 0 on pitch: with no natural damping it keeps ringing.
-    i_max: 2.0
-    max: 4.0                 # N*m. About half the pitch moment the thrusters can make (two thrusters 0.349 m
-                             #   from the centre); leaves the rest for depth.
+  # HEAVE, PITCH and YAW were RE-TUNED 2026-10-10 against the offline vehicle with REALISTIC odometry (4.5 Hz, 0.25 s late, 1.5 cm / 0.2 deg noise, freezes) and four plants
+  # (nominal, heavy+late, light+fast, stress) by control_code/tuning/loop_tuner.py. The old values (heave 60/60, pitch 6/5) were measured on perfect 100 Hz data: with the
+  # real sensing they chattered the thrusters by 2000 RPM peak-to-peak. The measured numbers below are for the NEW values (nominal plant, mean of 2 noise seeds).
+  # The SURGE block further down is still the old measurement on the old model.
+  heave:                   # depth hold -> Z force [N, + = down]
+    kp: 6.8                  # N per metre of depth error. Stiffness. Analogy: a spring pulling the vehicle back to the depth; stiffer = faster but it rings, and the noise of the depth reading is multiplied by it.
+                             #   MEASURED (0.4 m dive, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 61%, settle 37 s, thruster chatter 107 RPM
+                             #     x0.75 -> overshoot 45%, settle 33 s, thruster chatter 103 RPM
+                             #     x1 (this) -> overshoot 34%, settle 28 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 20%, settle 19 s, thruster chatter 115 RPM
+                             #     x2.0 -> overshoot 10%, settle 7 s, thruster chatter 115 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    ki: 0.5                  # N per (unit*s). Integral. Only removes a steady push (a current, a trim error). Analogy: leaning on the rope a little longer each second you are still off target.
+                             #   MEASURED (0.4 m dive, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 25%, settle 29 s, thruster chatter 95 RPM
+                             #     x0.75 -> overshoot 30%, settle 29 s, thruster chatter 95 RPM
+                             #     x1 (this) -> overshoot 34%, settle 28 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 41%, settle 40 s, thruster chatter 106 RPM
+                             #     x2.0 -> overshoot 46%, settle 38 s, thruster chatter 131 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    kd: 25                   # N per unit/s of the rate. Damping on the depth RATE (the vehicle has almost no natural damping, so this is what stops the ringing). Analogy: the shock absorber.
+                             #   MEASURED (0.4 m dive, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 40%, settle 37 s, thruster chatter 99 RPM
+                             #     x0.75 -> overshoot 36%, settle 30 s, thruster chatter 101 RPM
+                             #     x1 (this) -> overshoot 34%, settle 28 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 33%, settle 34 s, thruster chatter 129 RPM
+                             #     x2.0 -> overshoot 32%, settle 38 s, thruster chatter 170 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    i_max: 10                # N. Cap on the integral part: big enough for a few-N steady push without a long wind-up.
+    max: 25                  # Total heave force cap [N]; the two thrusters give about 23 N at 1800 RPM. Asking for more just saturates.
+    lpf_tau_s: 1.1           # s. Time constant of a low-pass on the loop OUTPUT: keeps measurement noise from flicking the thrusters. Analogy: a heavy flywheel between the sensor and the thrusters.
+                             #   MEASURED (0.4 m dive): x0.5 -> overshoot 32%, settle 29 s, thruster chatter 149 RPM | x0.75 -> overshoot 33%, settle 29 s, thruster chatter 114 RPM | x1 (this) -> overshoot 34%, settle 28 s, thruster chatter 97 RPM | x1.5 -> overshoot 36%, settle 27 s, thruster chatter 86 RPM | x2.0 -> overshoot 39%, settle 32 s, thruster chatter 85 RPM
+    sp_tau_s: 3              # s. Time constant of a first-order filter on the SETPOINT: a step becomes a smooth ramp, so a big move does not overshoot. Starts from the measurement.
+  pitch:                   # pitch hold -> M moment [N*m, + = nose up] by differential heave thrust
+    kp: 1.925                # N*m per radian of pitch error. Stiffness of the pitch hold (no righting moment on this vehicle: CG == CB, so only this loop keeps it level). Analogy: balancing a plank on a pivot.
+                             #   MEASURED (6 deg pitch step, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 20%, settle 24 s, thruster chatter 95 RPM
+                             #     x0.75 -> overshoot 19%, settle 18 s, thruster chatter 95 RPM
+                             #     x1 (this) -> overshoot 19%, settle 15 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 14%, settle 8 s, thruster chatter 101 RPM
+                             #     x2.0 -> overshoot 15%, settle 14 s, thruster chatter 124 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    ki: 0.01                 # N*m per (unit*s). Integral; only for a steady pitching moment.
+                             #   MEASURED (6 deg pitch step, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 18%, settle 15 s, thruster chatter 97 RPM
+                             #     x0.75 -> overshoot 18%, settle 15 s, thruster chatter 97 RPM
+                             #     x1 (this) -> overshoot 19%, settle 15 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 20%, settle 16 s, thruster chatter 97 RPM
+                             #     x2.0 -> overshoot 21%, settle 20 s, thruster chatter 97 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    kd: 6                    # N*m per unit/s of the rate. Damping on the pitch rate. Never 0: with no natural damping the pitch keeps ringing.
+                             #   MEASURED (6 deg pitch step, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 35%, settle 37 s, thruster chatter 99 RPM
+                             #     x0.75 -> overshoot 26%, settle 27 s, thruster chatter 96 RPM
+                             #     x1 (this) -> overshoot 19%, settle 15 s, thruster chatter 97 RPM
+                             #     x1.5 -> overshoot 12%, settle 12 s, thruster chatter 134 RPM
+                             #     x2.0 -> overshoot 7%, settle 14 s, thruster chatter 366 RPM
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    i_max: 1.5               # N*m. Cap on the integral part: big enough for a few-N steady push without a long wind-up.
+    max: 4                   # Pitch moment cap [N*m]: about half what the two heave thrusters can make. Asking for more just saturates.
+    lpf_tau_s: 0.36          # s. Output low-pass (noise filter), see heave.
+                             #   MEASURED (6 deg pitch step): x0.5 -> overshoot 18%, settle 15 s, thruster chatter 119 RPM | x0.75 -> overshoot 19%, settle 15 s, thruster chatter 105 RPM | x1 (this) -> overshoot 19%, settle 15 s, thruster chatter 97 RPM | x1.5 -> overshoot 20%, settle 15 s, thruster chatter 98 RPM | x2.0 -> overshoot 21%, settle 19 s, thruster chatter 99 RPM
+    sp_tau_s: 3              # s. Time constant of a first-order filter on the SETPOINT: a step becomes a smooth ramp, so a big move does not overshoot. Starts from the measurement.
   surge:                     # position hold along the start heading -> X force [N] on the axial thruster (+/- RPM)
     kp: 8.0                  # N per metre. MEASURED with a 4 N current pushing for 10 s: kp 2 -> drifts 0.92 m;
                              #   4 -> 0.67 m;  8 -> 0.42 m;  16 -> 0.24 m;  32 -> 0.15 m. (Peak excursion goes
@@ -115,25 +151,45 @@ gains:
                              #   25 -> 8.9%, 5.5 s;  50 -> 14%, 38 s (too heavy-handed).
     i_max: 4.0
     max: 20.0                # N. Thrust cap (axial thruster at ~1000 RPM gives ~7 N, 1800 RPM ~ 23 N).
-  yaw:                       # heading hold -> N moment [N*m] via the fins. NEEDS FORWARD FLOW (see fin section).
-    kp: 3.0                  # N*m per rad. MEASURED at 1 m/s, 30 deg turn: kp 1 -> 23% overshoot, 21 s;
-                             #   3 -> 6.4%, 3.3 s;  6 -> 4.5%, 2.2 s;  12 -> 5.3%, 1.7 s.
-                             #   Analogy: steering a car — twitchy (high kp) is quick but needs good hands.
-    ki: 0.1
-    kd: 3.0                  # N*m per (rad/s). 0 -> 16% overshoot;  1.5 -> 9%;  3 -> 6.4%;  6 -> 6.9%, 4.7 s.
-    i_max: 0.5
-    max: 3.0                 # N*m. Four fins at 25 deg give about 2.6 N*m at 1 m/s (force grows with speed^2).
+  yaw:                     # heading hold -> N moment [N*m] via the fins. NEEDS FORWARD FLOW (see fin section).
+    kp: 3                    # N*m per radian of heading error. Stiffness of the heading hold (needs fin flow: forward speed above ~0.4 m/s). Analogy: how hard the driver turns the wheel per degree of heading error.
+                             #   MEASURED (30 deg heading step at 0.8 m/s, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 1%, settle 7 s, fin swing 1.2 deg
+                             #     x0.75 -> overshoot 1%, settle 5 s, fin swing 1.4 deg
+                             #     x1 (this) -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x1.5 -> overshoot 2%, settle 3 s, fin swing 2.3 deg
+                             #     x2.0 -> overshoot 4%, settle 2 s, fin swing 3.6 deg
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    ki: 0.0001               # N*m per (unit*s). Integral; the vehicle has no steady yaw moment, keep it tiny.
+                             #   MEASURED (30 deg heading step at 0.8 m/s, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x0.75 -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x1 (this) -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x1.5 -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x2.0 -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    kd: 3.6                  # N*m per unit/s of the rate. Damping on the yaw rate. Too much slows the turn; too little overshoots.
+                             #   MEASURED (30 deg heading step at 0.8 m/s, nominal plant, 4.5 Hz odometry 0.25 s late with noise; 0.5x .. 2x of this value):
+                             #     x0.5 -> overshoot 8%, settle 3 s, fin swing 1.2 deg
+                             #     x0.75 -> overshoot 2%, settle 3 s, fin swing 1.4 deg
+                             #     x1 (this) -> overshoot 1%, settle 4 s, fin swing 1.6 deg
+                             #     x1.5 -> overshoot 2%, settle 5 s, fin swing 2.2 deg
+                             #     x2.0 -> overshoot 1%, settle 6 s, fin swing 3.7 deg
+                             #   A change of about 1.5x-2x is a considerable change. Checked on three more plants (heavy+late, light+fast, stress): the first two pass the same criteria; the stress plant stays stable but with more overshoot/chatter (see the header).
+    i_max: 0.5               # N*m. Cap on the integral part: big enough for a few-N steady push without a long wind-up.
+    max: 3                   # Yaw moment cap [N*m] (the fins give 0.7 N*m at 0.5 m/s and 2.7 at 1 m/s). Asking for more just saturates.
+    lpf_tau_s: 0.2           # s. Output low-pass: smooths the fin command (fins at 1 m/s turn 1 deg of noise into several degrees of deflection).
+                             #   MEASURED (30 deg heading step at 0.8 m/s): x0.5 -> overshoot 1%, settle 4 s, fin swing 1.9 deg | x0.75 -> overshoot 1%, settle 4 s, fin swing 1.8 deg | x1 (this) -> overshoot 1%, settle 4 s, fin swing 1.6 deg | x1.5 -> overshoot 2%, settle 4 s, fin swing 1.5 deg | x2.0 -> overshoot 2%, settle 3 s, fin swing 1.2 deg
 
-# ---------------------------------------------------------------------------
 feedforward:
-  heave_n: 7.25              # N (+ = down) added to the depth loop's output. The vehicle floats UP with
-                             #   (10.74 - 10.0) kg * 9.81 = 7.25 N net buoyancy (Mako_01.mavsim). This pre-cancels
-                             #   it, like pressing the gas pedal a little before going uphill instead of waiting
-                             #   to slow down first.
-                             #   MEASURED (hold from rest, 30 s): ff 0 -> sags 0.12 m, leaves 9.5 cm final error
-                             #   (integral still crawling); ff 3.6 -> 6 cm; ff 7.25 -> 3.6 cm peak, 0 final.
-                             #   +/-2 N of error is already visible as a ~3 cm steady offset at kp 60.
-                             #   If you add payload or ballast, change this to match the new net buoyancy.
+  heave_n: 0.0               # N (+ = down) added to the depth loop's output = the vehicle's net buoyancy. 0 is right for the
+                             #   current vessel file ("Mako (1).mavsim": mass 20 kg = buoyancy 20 kg, NEUTRALLY buoyant, and the live
+                             #   sim coasted force-free). The old file had 10 / 10.74 kg => +7.25 N, which is why this used to be 7.25.
+                             #   A WRONG value is not harmless: 7.25 N on a neutral 20 kg vehicle sinks it ~1 m in 5 s with the offline model's assumed drag, ~3 m with none.
+                             #   Analogy: pressing the gas a little before a hill. No hill, no extra gas.
+                             #   Re-measure if you change the vessel: let it hover with the depth loop and read the steady heave force
+                             #   in the log (Z in the status line), then enter that value. Add payload/ballast -> change it.
+                             #   (Measured on the old +7.25 N model: ff 0 -> sags 0.12 m; ff 7.25 -> 0 final error.)
   apply_when_depth_disabled: true   # keep pushing down by heave_n even if enable.depth is false (so the vehicle
                                     # does not just float away while you commission other loops).
 
@@ -161,13 +217,16 @@ slew:                        # max rate of change of the ACTUAL command (0 = unl
 # ---------------------------------------------------------------------------
 limits:
   rpm_cap: 1800.0            # soft cap on every thruster [RPM] (hardware limit 2668).
-                             #   VERY IMPORTANT for hovering: the vehicle floats up with 7.25 N, so the heave thrusters
-                             #   must overcome that before they can do anything else.
-                             #   MEASURED (6 N downward push): cap 800 -> cannot hold, drifts 5.4 m;  1000 -> 0.86 m;
-                             #   1400 -> 0.098 m;  1800 or 2668 -> 0.098 m (same, no extra benefit).
-                             #   (The older depth/waypoint controllers use 1000 — marginal for this vehicle.)
+                             #   The two heave thrusters give about 23 N in total at 1800 RPM (about 7 N at 1000 RPM) under the
+                             #   assumed thrust law. A neutral vehicle needs no trim force, so 1000 is enough for gentle moves, but a
+                             #   disturbance of a few N needs more: MEASURED on the old +7.25 N model (6 N push): cap 800 drifts 5.4 m,
+                             #   1000 -> 0.86 m, 1400 or more -> 0.098 m. Re-measure for the neutral 20 kg model if it matters.
                              #   Based on the ASSUMED thrust law (common/mako_geometry.yaml: rpm_to_rps). If the real
                              #   sim's thrust is weaker, depth hold will saturate: check the logs.
+  small_force_n: 0.3         # [N] Below this thrust the force-to-RPM map is a straight line instead of a square root. Thrust grows with RPM squared, so the exact inverse (RPM ~ sqrt(force))
+                             #   has an INFINITE slope at zero: a +-0.5 N flicker in the demand (sensor noise x gain) becomes a +-370 RPM flip of the propeller. With 0.3 N a flicker of
+                             #   +-0.3 N is only +-110 RPM. MEASURED (heave/pitch hold, noisy odometry): 0 -> chatter 380-560 RPM peak-to-peak, 0.3 -> 100-250 RPM. The price: for a demand
+                             #   below 0.3 N the thruster delivers a bit less than asked (F^2/0.3), which the feedback loops simply see as a softer gain near zero.
   fin_deg_cap: 25.0          # soft cap on each fin [deg] (hardware +-35). Lower it for gentler steering and to stay
                              #   out of fin stall; 25 keeps ~70% of the available force.
   # Fin gain scheduling. Fin force ~ speed^2, so the SAME deflection is 4x stronger at 1 m/s than at 0.5 m/s.
@@ -196,4 +255,22 @@ safety:
 
 logging:
   status_period_s: 2.0
-  dir: ~/station_keeping_logs   # one CSV per run
+  dir: logs/station_keeping   # one CSV per run
+
+# ---------------------------------------------------------------------------
+# STATE ESTIMATOR  (common/pose_filter.py): turns the slow, late, noisy odometry into a smooth state at the control rate
+# ---------------------------------------------------------------------------
+# The real sim's odometry arrives at ~4.5 Hz, ~0.25 s old, and (offline, with `fake_vehicle.py --realistic`) noisy. Feeding the loops the raw samples turns every sample's
+# noise into a step in the command: 1.5 cm of depth noise times a gain of 60 N/m is a 0.9 N flick, which the thruster map turns into hundreds of RPM.
+# The filter keeps a motion model in the loop (one small Kalman filter per axis) and predicts smoothly between samples. Analogy: reading a speedometer that only
+# updates four times a second and is a quarter-second late: you do not jump at each new reading, you keep a running picture of where the car is.
+# Measured offline (4.5 Hz, 0.25 s, 1.5 cm / 0.2 deg noise): depth RMS error 0.8 cm, forward speed 1.4 cm/s.
+estimator:
+  filter: true               # false = use the raw odometry like before (the old behaviour). Turn off only to compare.
+  odom_latency_s: 0.25       # how old a sample is when it arrives (ASSUMED; measure it on the real sim by comparing a step of thrust with the first odometry reaction).
+                             #   Too small: the vehicle is predicted slightly behind where it is -> more overshoot. Too large: predicted ahead -> a little chatter.
+                             #   +-0.1 s changes the predicted position by v*0.1 (5 cm at 0.5 m/s); only matters for fast manoeuvres.
+  accel_noise_lin: 0.25      # [m/s^2] how fast the vehicle may change speed (process noise). Higher = trusts new samples more (follows faster, noisier). 0.5 N-ish thrust / 20 kg = 0.5.
+  accel_noise_ang: 0.8       # [rad/s^2] the same for roll/pitch/yaw.
+  pos_sigma_m: 0.015         # assumed noise of a position sample. Higher = smoother and slower to react.
+  ang_sigma_rad: 0.0044      # assumed noise of an angle sample (0.25 deg).

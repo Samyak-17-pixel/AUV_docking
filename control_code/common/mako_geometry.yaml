@@ -1,5 +1,7 @@
 # Mako_01 vehicle geometry used by allocation.py and the offline model.
-# SOURCE: Mako_01.mavsim -> config.json -> agents[0] (extracted 2026-10-01).
+# SOURCE: "Mako (1).mavsim" -> config.json -> agents[0] (re-extracted 2026-10-08). This is the only vessel file on disk now; the older
+# Mako_01.mavsim (mass 10 kg, buoyancy 10.74 kg => +7.25 N, fin ids cs_06/cs_08 the other way round) was replaced by it and its live-sim
+# behaviour (neutral buoyancy, measured 2026-10-01) matches the new file, so these are the numbers used.
 # Body frame: x forward, y starboard, z DOWN (NED-style). Euler order ZYX (deg), matching mavsim.
 # Wrench order everywhere: [X, Y, Z, K, M, N] = surge, sway, heave(+down), roll, pitch(+nose up), yaw(+bow to starboard).
 #
@@ -9,8 +11,8 @@
 vehicle:
   rho: 1000.0                    # kg/m^3 (config: density)
   gravity: 9.80665
-  mass_kg: 10.0
-  buoyancy_mass_kg: 10.739857503097697   # -> net buoyancy = +7.25 N (vehicle floats up by itself)
+  mass_kg: 20.0
+  buoyancy_mass_kg: 20.0         # -> net buoyancy = 0 N: NEUTRALLY buoyant, so no heave trim is needed (old file: 10 / 10.74 kg = +7.25 N)
   cg_minus_cb_m: [0.0, 0.0, 0.0] # CG == CB in the config -> NO passive pitch/roll righting moment
   gyration_m: [0.078, 0.35, 0.35]        # radii of gyration about x, y, z (config)
   # Linear drag [N per m/s] and [N*m per rad/s]. Config: X_u=-0.01, Y_v=-0.01, N_r=-0.01, Z_w=K_p=M_q=0.
@@ -44,9 +46,11 @@ fins:
   # location y,z from config. Config says x=0.0 but the fin geometry (LE/TE root x in -0.418..-0.490 m)
   # places the fins aft: ASSUMPTION moment arm x = -0.454 m (mid-chord).
   cs_04: {location: [-0.454,  0.05126524, -0.05126524], orientation: [ 45.0, 0.0, 0.0]}
-  cs_06: {location: [-0.454,  0.05126524,  0.05126524], orientation: [135.0, 0.0, 0.0]}
+  # NOTE cs_06 and cs_08 are swapped w.r.t. the old Mako_01.mavsim. In "Mako (1).mavsim": id 8 sits at (+y,+z) with roll angle 135 deg,
+  # id 6 at (-y,-z) with -45 deg. With the old mapping a yaw command came out as a PITCH moment (checked numerically 2026-10-08).
+  cs_06: {location: [-0.454, -0.05126524, -0.05126524], orientation: [-45.0, 0.0, 0.0]}
   cs_07: {location: [-0.454, -0.05126524,  0.05126524], orientation: [225.0, 0.0, 0.0]}
-  cs_08: {location: [-0.454, -0.05126524, -0.05126524], orientation: [-45.0, 0.0, 0.0]}
+  cs_08: {location: [-0.454,  0.05126524,  0.05126524], orientation: [135.0, 0.0, 0.0]}
   delta_max_deg: 35.0
   area_m2: 0.00473336588
   # ASSUMPTION: lift slope of the small low-aspect fin. Fin force = 0.5*rho*A*cl_alpha*delta_rad*U^2.

@@ -35,7 +35,7 @@ BEFORE YOU RUN (the vehicle will move!)
        docker exec <bridge-container> pkill -f teleop_node.py
   3. Only one controller at a time. Ctrl-C stops the test and sends zero commands.
 
-Settings (step sizes, setpoints, gains, safety limits): dof_testing.yaml   Logs: ~/dof_testing_logs/
+Settings (step sizes, setpoints, gains, safety limits): dof_testing.yaml   Logs: outputs/logs/dof_testing/
 More detail: ../../execution.md section 7.
 EOF
 }

@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DVL.msg"
   "msg/WaveProbe.msg"
   "msg/DockAlign.msg"
+  "msg/SideScan.msg"
   DEPENDENCIES std_msgs geometry_msgs # Add packages that above messages depend on
 )
 

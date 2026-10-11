@@ -59,8 +59,8 @@ def test_fin_modes_are_orthogonal_roll_pitch_yaw(alloc):
     B = alloc.B_fin
     # columns are cs_04, cs_06, cs_07, cs_08; rows K, M, N
     assert np.sign(B[0]).tolist() == [1, 1, 1, 1]                 # roll: all same sign
-    assert np.sign(B[1]).tolist() == [1, 1, -1, -1]               # pitch: top pair vs bottom pair
-    assert np.sign(B[2]).tolist() == [-1, 1, 1, -1]               # yaw: left/right pairs
+    assert np.sign(B[1]).tolist() == [1, -1, -1, 1]               # pitch: top pair vs bottom pair
+    assert np.sign(B[2]).tolist() == [-1, -1, 1, 1]               # yaw: left/right pairs
     G = B @ B.T
     assert np.allclose(G - np.diag(np.diag(G)), 0, atol=1e-9)     # decoupled
 
@@ -84,3 +84,44 @@ def test_fins_scale_with_speed_squared_and_fade_out(alloc):
 
 def test_fin_cap(alloc):
     assert max(abs(v) for v in alloc.fins_from_moments(0, 0, 100.0, 1.0).values()) <= alloc.fin_cap_deg + 1e-9
+
+
+def test_fin_ids_match_the_vessel_file():
+    """'Mako (1).mavsim': id4 (+y,-z) 45 deg, id8 (+y,+z) 135 deg, id7 (-y,+z) 225 deg, id6 (-y,-z) -45 deg.
+    With cs_06 and cs_08 the other way round, a yaw command comes out as a pitch moment."""
+    fins = Allocator().g["fins"]
+    expect = {"cs_04": (1, -1, 45.0), "cs_08": (1, 1, 135.0), "cs_07": (-1, 1, 225.0), "cs_06": (-1, -1, -45.0)}
+    for name, (sy, sz, roll) in expect.items():
+        loc, ori = fins[name]["location"], fins[name]["orientation"]
+        assert np.sign(loc[1]) == sy and np.sign(loc[2]) == sz, name
+        assert ori[0] == pytest.approx(roll), name
+
+
+def test_yaw_command_produces_yaw_and_no_pitch_or_roll():
+    a = Allocator(u_fin_off=0.0, u_fin_full=0.0)
+    w = a.wrench_from_fins(a.fins_from_moments(0.0, 0.0, 0.5, 1.0), 1.0)
+    assert w[5] == pytest.approx(0.5, rel=1e-6)
+    assert abs(w[3]) < 1e-9 and abs(w[4]) < 1e-9
+
+
+def test_fins_reverse_their_deflection_for_the_same_moment_in_reverse_flow():
+    from allocation import Allocator
+    a = Allocator()
+    fwd = a.fins_from_moments(0.0, 0.0, 0.5, 0.8)
+    rev = a.fins_from_moments(0.0, 0.0, 0.5, -0.8)
+    assert all(abs(fwd[k] + rev[k]) < 1e-9 for k in fwd) and any(abs(v) > 1e-3 for v in fwd.values())
+    # and the physical model closes the loop: the delivered yaw moment has the demanded sign in both flow directions
+    for u, d in ((0.8, fwd), (-0.8, rev)):
+        assert a.wrench_from_fins(d, u)[5] == pytest.approx(0.5, rel=0.05)
+
+
+def test_small_force_region_is_linear_continuous_and_changes_nothing_above_the_joint():
+    base = Allocator()
+    soft = Allocator(small_force_n=1.0)
+    for f in (1.0, 2.0, 5.0, -3.0):
+        assert soft.force_to_rpm("th_02", f) == pytest.approx(base.force_to_rpm("th_02", f))          # identical at and above the joint
+    # continuous at the joint, linear below it, and far gentler than the square root near zero
+    r1, r_half, r_small = soft.force_to_rpm("th_02", 1.0), soft.force_to_rpm("th_02", 0.5), soft.force_to_rpm("th_02", 0.05)
+    assert r_half == pytest.approx(0.5 * r1) and r_small == pytest.approx(0.05 * r1)
+    assert abs(base.force_to_rpm("th_02", 0.05)) > 3.0 * abs(r_small)
+    assert soft.force_to_rpm("th_02", -0.5) == pytest.approx(-r_half)

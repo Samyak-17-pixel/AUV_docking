@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,11 @@ from rclpy.node import Node
 
 from interfaces.msg import Actuator
 
+_COMMON = str(Path(__file__).resolve().parents[1] / "common")
+if _COMMON not in sys.path:
+    sys.path.insert(0, _COMMON)
+from pid import Pid, clamp  # noqa: E402  (shared with dof_testing / station_keeping; was a private copy here)
+
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "depth_control.yaml"
 
 
@@ -37,56 +43,6 @@ def load_config(path: Path) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"Config must be a mapping: {path}")
     return cfg
-
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-class Pid:
-    """Basic PID with integral clamp and optional derivative low-pass."""
-
-    def __init__(
-        self,
-        kp: float,
-        ki: float,
-        kd: float,
-        i_max: float,
-        d_filter_tau_s: float,
-    ) -> None:
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.i_max = abs(i_max)
-        self.d_filter_tau_s = max(0.0, d_filter_tau_s)
-        self.integral = 0.0
-        self._prev_error: Optional[float] = None
-        self._d_filtered = 0.0
-
-    def update(self, error: float, dt: float) -> float:
-        if dt <= 0.0:
-            return self.kp * error
-
-        self.integral += error * dt
-        if self.ki > 1e-12:
-            self.integral = clamp(
-                self.integral, -self.i_max / self.ki, self.i_max / self.ki
-            )
-        else:
-            self.integral = 0.0
-
-        if self._prev_error is None:
-            derivative = 0.0
-        else:
-            derivative = (error - self._prev_error) / dt
-        self._prev_error = error
-
-        if self.d_filter_tau_s > 0.0:
-            alpha = dt / (self.d_filter_tau_s + dt)
-            self._d_filtered += alpha * (derivative - self._d_filtered)
-            derivative = self._d_filtered
-
-        return self.kp * error + self.ki * self.integral + self.kd * derivative
 
 
 class DepthControl(Node):

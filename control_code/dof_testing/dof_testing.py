@@ -14,6 +14,7 @@ import csv
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,8 +23,11 @@ import yaml
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "common"))
+from outdirs import out_dir  # noqa: E402
 
 from allocation import Allocator  # noqa: E402
+from live_gains import attach as attach_live_gains  # noqa: E402
+from pose_filter import PoseFilterConfig, PoseTracker  # noqa: E402
 from loops import HoldLoops  # noqa: E402
 from state import State, wrap_pi  # noqa: E402
 
@@ -41,7 +45,7 @@ def make_allocator(cfg: dict) -> Allocator:
     lim = cfg["limits"]
     return Allocator(
         rpm_cap=lim["rpm_cap"], fin_deg_cap=lim["fin_deg_cap"],
-        u_fin_min=lim["u_fin_min_mps"], u_fin_off=lim["u_fin_off_mps"], u_fin_full=lim["u_fin_full_mps"],
+        u_fin_min=lim["u_fin_min_mps"], u_fin_off=lim["u_fin_off_mps"], u_fin_full=lim["u_fin_full_mps"], small_force_n=lim.get("small_force_n", 0.0),
     )
 
 
@@ -68,6 +72,7 @@ class DofTest:
         self._run_meas: List[float] = []
         self._run_err: List[float] = []
         self._run_times: List[float] = []
+        self._run_sig: List[tuple] = []   # full state per tick, to detect a frozen simulation
         self.uses_fins = dof in FIN_DOFS
 
     # ------------------------------------------------------------- measurements
@@ -203,6 +208,7 @@ class DofTest:
             dof = self.dof
             w = self._run_wrench(st, dt)
             self._run_times.append(self._phase_t)
+            self._run_sig.append((st.depth, st.roll, st.pitch, st.yaw, *[float(v) for v in st.nu]))
             self._run_meas.append(self._meas(st))
             self._run_err.append(self._hold_error(st) if self.mode == "hold" else 0.0)
             dur = self.cfg["step"]["duration_s"][dof] if self.mode == "step" else t_cfg["hold_duration_s"]
@@ -228,9 +234,40 @@ class DofTest:
     def _neutral(self) -> Dict[str, float]:
         return {n: 0.0 for n in self.alloc.th_ids + self.alloc.fin_ids}
 
+    def debug(self) -> dict:
+        """Setpoints of the current phase for the viewer's plots (published on ctrl_debug). Empty before the start state is captured."""
+        s0 = self._start
+        if s0 is None:
+            return {"ctrl": "dof_testing", "mode": f"{self.dof} {self.mode}: {self.phase}"}
+        h = self.cfg["hold"]
+        out = {"ctrl": "dof_testing", "mode": f"{self.dof} {self.mode}: {self.phase}", "depth_sp": float(s0.depth), "pitch_sp_deg": 0.0, "yaw_sp_deg": math.degrees(s0.yaw)}
+        if self.mode == "hold" and self.phase == "run":
+            if self.dof == "heave":
+                out["depth_sp"] = float(s0.depth + h["heave_delta_m"])
+            elif self.dof == "pitch":
+                out["pitch_sp_deg"] = float(h["pitch_deg"])
+            elif self.dof == "yaw":
+                out["yaw_sp_deg"] = math.degrees(s0.yaw) + float(h["yaw_delta_deg"])
+        return out
+
+    def _frozen(self) -> bool:
+        """True if NOTHING in the state changed during the whole run (identical to 1e-9): the sim is paused or the
+        odometry is frozen. Seen on the live sim 2026-10-01: a PASS/FAIL from such a run means nothing."""
+        if len(self._run_sig) < 5:
+            return False
+        a = np.asarray(self._run_sig)
+        return bool(np.all(np.ptp(a, axis=0) < 1e-9))
+
     def _finish(self) -> None:
         self.done = True
         n = len(self._run_meas)
+        if self._frozen():
+            self.result = {
+                "verdict": "INVALID", "mode": self.mode, "dof": self.dof,
+                "reason": "the state did not change at all during the run: the simulation is paused or the odometry is "
+                          "frozen. No verdict is possible. Check that the sim is playing and run again.",
+            }
+            return
         if self.mode == "step":
             tail = self._run_meas[int(0.6 * n):]
             resp = float(np.mean(tail)) - self._baseline_mean
@@ -244,6 +281,10 @@ class DofTest:
                            "(surge: u>0, heave: depth increasing=down, pitch: nose up, yaw: to starboard, "
                            "roll: starboard down, sway: moves right)",
             }
+            if not ok and abs(resp) < 0.1 * need:
+                self.result["hint"] = ("almost no response at all: this DOF may be LOCKED in the session (check active_dof in "
+                                       "the vessel file: [surge, sway, heave, roll, pitch, yaw]), the thruster may be at its cap, "
+                                       "or the sim may be intermittently freezing")
         else:
             tail = self._run_err[int((1.0 - self.cfg["timing"]["settle_fraction"]) * n):]
             err = float(np.mean(np.abs(tail)))
@@ -255,7 +296,7 @@ class DofTest:
     def write_csv(self, directory: str) -> Optional[Path]:
         if not self.log:
             return None
-        d = Path(os.path.expanduser(directory))
+        d = out_dir(directory)
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"dof_{self.dof}_{self.mode}.csv"
         fields: List[str] = []
@@ -296,6 +337,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from interfaces.msg import Actuator
+    from std_msgs.msg import String
+    import json
 
     class Node_(Node):
         def __init__(self) -> None:
@@ -306,22 +349,58 @@ def main(argv: Optional[List[str]] = None) -> None:
             self.dt = 1.0 / float(cfg["node"]["rate_hz"])
             self._since_status = 0.0
             self.pub = self.create_publisher(Actuator, cfg["topics"]["actuator_cmd"], 10)
-            self.create_subscription(Odometry, cfg["topics"]["odometry"], lambda m: setattr(self, "st", State.from_odom(m)), 10)
+            self.dbg_pub = self.create_publisher(String, f"/{cfg['node'].get('vessel', 'Mako_01')}/ctrl_debug", 10)   # setpoints for the viewer's plots
+            self._dbg_t = 0.0
+            est = cfg.get("estimator", {})
+            self.use_filter = bool(est.get("filter", True))
+            self.tracker = PoseTracker(float(est.get("odom_latency_s", 0.25)), 1.0, PoseFilterConfig(**{k: v for k, v in est.items() if k not in ("filter", "odom_latency_s")}))
+            self._t0 = time.monotonic()
+            self.frozen_s = 0.0
+            self.create_subscription(Odometry, cfg["topics"]["odometry"], self._on_odom, 10)
+            attach_live_gains(self, cfg["node"].get("vessel", "Mako_01"), "dof_testing", self.test.loops, self.get_logger().info)
             self.create_timer(self.dt, self._tick)
             self.get_logger().info(f"dof_testing: dof={args.dof} mode={args.mode}; waiting for odometry")
+
+        def _on_odom(self, msg) -> None:
+            raw = State.from_odom(msg)
+            self.tracker.push(raw, time.monotonic() - self._t0)
+            if not self.use_filter:
+                self.st = raw
 
         def publish(self, values: Dict[str, float]) -> None:
             m = Actuator()
             m.actuator_names = list(self.names)
             m.actuator_values = [float(values.get(n, 0.0)) for n in self.names]
             m.covariance = [0.0] * len(self.names)
+            self._cmd_active = any(abs(float(values.get(n, 0.0))) > (50.0 if n.startswith("th_") else 1.0) for n in self.names)
             self.pub.publish(m)
 
         def _tick(self) -> None:
+            if self.use_filter:                                   # smooth state from the slow, late, noisy odometry (common/pose_filter.py)
+                now = time.monotonic() - self._t0
+                f = self.tracker.at(now)
+                if f is not None:
+                    self.st = f
+                if f is not None and self.tracker.frozen(now, expect_motion=getattr(self, "_cmd_active", True)):
+                    # The odometry stopped changing (the real sim does this for 5-25 s). Controlling on stale data winds the integrators up and, with no righting moment,
+                    # the pitch ran away to 77 deg in a test: command NEUTRAL, pause the test clock, and give up with INVALID if it lasts.
+                    self.frozen_s += self.dt
+                    self.publish({})
+                    self.get_logger().warning("odometry frozen -> neutral", throttle_duration_sec=2.0)
+                    if self.frozen_s > 3.0 and not self.test.done:
+                        self.test.done = True
+                        self.test.result = {"verdict": "INVALID", "mode": self.test.mode, "dof": self.test.dof,
+                                            "reason": f"the odometry froze for more than 3 s during the test (total {self.frozen_s:.0f} s): no verdict is possible. Run again."}
+                        raise SystemExit(0)
+                    return
             if self.st is None:
                 self.publish({})
                 return
             out, w = self.test.update(self.st, self.dt)
+            self._dbg_t += self.dt
+            if self._dbg_t >= 0.5:
+                self._dbg_t = 0.0
+                self.dbg_pub.publish(String(data=json.dumps(self.test.debug())))
             self.publish(out)
             self._since_status += self.dt
             if self._since_status >= float(cfg["logging"]["status_period_s"]):

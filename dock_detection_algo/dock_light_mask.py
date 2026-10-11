@@ -7,7 +7,7 @@ while the bloom mask is kept for visualization.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -49,6 +49,47 @@ def _build_bloom_mask(
             mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         )
     return mask
+
+
+def background_excess(v: np.ndarray, bg_ref_v: float, row_pct: float = 10.0, smooth_rows: float = 15.0) -> np.ndarray:
+    """Per-row brightness of the water ABOVE the nominal dark level `bg_ref_v` (0-255), as a column vector H x 1 (float32).
+
+    The water is estimated per image row as a low percentile of V (a row is never mostly light), then smoothed over rows, so a vertical brightness
+    ramp (backscatter, sun) and a uniformly brighter, murkier water are both measured. In clear water the estimate is below `bg_ref_v` and the excess is
+    ZERO: the image is not touched at all. Subtracting it from V lets the same thresholds work in murky water."""
+    pct = np.percentile(v, row_pct, axis=1).astype(np.float32)
+    k = max(3, int(smooth_rows * 4) | 1)
+    pct = cv2.GaussianBlur(pct.reshape(-1, 1), (1, k), float(smooth_rows)).reshape(-1)
+    return np.maximum(pct - float(bg_ref_v), 0.0)[:, None]
+
+
+def _plateau_centre(v_f: np.ndarray, x: float, y: float, min_px: int, half: int = 45, tol: float = 2.0) -> Optional[Core]:
+    """Centre of the saturated plateau around a peak. A light brighter than the sensor range (or on a bright background) clips to a flat top; the DoG
+    peak then lands anywhere on it (up to ~9 px off in murky water). If the connected region within `tol` grey levels of the local maximum has at least `min_px`
+    pixels, its centroid is returned, else None (the caller keeps the response-weighted centre, which is smoother for unclipped lights)."""
+    h, w = v_f.shape
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1, y0, y1 = max(0, xi - half), min(w, xi + half + 1), max(0, yi - half), min(h, yi + half + 1)
+    win = v_f[y0:y1, x0:x1]
+    if win.size == 0:
+        return None
+    px, py = xi - x0, yi - y0
+    vmax = float(win[max(0, py - 2):py + 3, max(0, px - 2):px + 3].max())
+    reg = (win >= vmax - tol).astype(np.uint8)
+    n, lab = cv2.connectedComponents(reg, connectivity=8)
+    if n <= 1:
+        return None
+    l = lab[min(max(py, 0), lab.shape[0] - 1), min(max(px, 0), lab.shape[1] - 1)]
+    if l == 0:
+        ys, xs = np.nonzero(reg)
+        if xs.size == 0:
+            return None
+        k = int(np.argmin((xs - px) ** 2 + (ys - py) ** 2))
+        l = lab[ys[k], xs[k]]
+    ys, xs = np.nonzero(lab == l)
+    if xs.size < min_px or xs.size > 0.35 * win.size:
+        return None
+    return (float(xs.mean() + x0), float(ys.mean() + y0))
 
 
 def _cores_from_contours(mask: np.ndarray, min_area: float, max_blobs: int) -> List[Core]:
@@ -110,6 +151,8 @@ def _cores_from_peaks(
     peak_abs_v_frac: float = 0.7,
     refine_half_window: int = 2,
     fallback_dist_min: float = 1.0,
+    candidates: int = 0,
+    plateau_min_px: int = 0,
 ) -> List[Core]:
     """Find light cores as local maxima even when bloom blobs merge.
 
@@ -186,11 +229,17 @@ def _cores_from_peaks(
 
     scores = response[ys, xs] if response.max() > 0 else dist[ys, xs].astype(np.float32)
     max_peaks = int(max_blobs) if max_blobs and max_blobs > 0 else 4
+    max_peaks = max(max_peaks, int(candidates))
     cores = _nms_peaks(ys, xs, scores.astype(np.float32), min_sep=float(sep), max_peaks=max_peaks)
 
     # Sub-pixel refine on response with a tiny window
     refined: List[Core] = []
     for x, y in cores:
+        if plateau_min_px > 0:
+            pc = _plateau_centre(v_f, x, y, int(plateau_min_px))
+            if pc is not None:
+                refined.append(pc)
+                continue
         xi, yi = int(round(x)), int(round(y))
         r = int(refine_half_window)
         x0, x1 = max(0, xi - r), min(w, xi + r + 1)
@@ -233,6 +282,11 @@ def bloom_mask_and_cores(
     peak_abs_v_frac: float = 0.7,
     refine_half_window: int = 2,
     fallback_dist_min: float = 1.0,
+    candidates: int = 0,
+    plateau_min_px: int = 0,
+    bg_subtract: bool = False,
+    bg_ref_v: float = 50.0,
+    bg_row_pct: float = 10.0,
 ) -> Tuple[np.ndarray, List[Core]]:
     """Bloom mask for display + robust cores (peaks when lights merge).
 
@@ -242,8 +296,15 @@ def bloom_mask_and_cores(
         peak_sep: Minimum pixel separation between cores (NMS).
         core_pct: Percentile of bloom V used for tight core mask (80–99).
         max_blobs: Keep at most this many cores (4 for the dock).
+        candidates: if larger than max_blobs, up to this many peaks are returned (strongest first) so the caller can pick the ring among them.
+        bg_subtract: remove the water's brightness above `bg_ref_v` (per image row) before thresholding. No effect when the water is dark (clear).
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    if bg_subtract:
+        ex = background_excess(hsv[:, :, 2], bg_ref_v, bg_row_pct)
+        if float(ex.max()) > 0.0:
+            hsv = hsv.copy()
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2].astype(np.float32) - ex, 0, 255).astype(np.uint8)
     v = hsv[:, :, 2]
     mask = _build_bloom_mask(
         hsv,
@@ -276,6 +337,8 @@ def bloom_mask_and_cores(
             peak_abs_v_frac=peak_abs_v_frac,
             refine_half_window=refine_half_window,
             fallback_dist_min=fallback_dist_min,
+            candidates=candidates,
+            plateau_min_px=plateau_min_px,
         )
     else:
         cores = _cores_from_contours(mask, min_area, max_blobs)

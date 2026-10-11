@@ -201,7 +201,10 @@ def evaluate_dock_geometry(
     if center_exact:
         recovered = _cross_ratio_center(top, direction, length, along_m)
         if recovered is not None:
-            guidance = recovered
+            # Blend instead of switching: full cross-ratio centre at lateral 0, the plain midpoint at the gate. A hard switch made the
+            # centre jump by ~11 px (it flickered when the lateral cue hovered at the gate), which the controller turned into thruster spikes.
+            w = 1.0 - abs(lateral_px) / max(exact_thr, 1e-6)
+            guidance = (diameter_mid[0] + w * (recovered[0] - diameter_mid[0]), diameter_mid[1] + w * (recovered[1] - diameter_mid[1]))
             obliqueness = along_m / length - FRONTAL_FRACTION
         else:
             center_exact = False

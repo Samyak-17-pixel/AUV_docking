@@ -38,6 +38,9 @@ class VehicleModel:
         # diag mass matrix [m(1+a_u), m(1+a_v), m(1+a_w), Ixx(1+..), Iyy(1+..), Izz(1+..)]
         self.M = np.concatenate([m * (1 + af[:3]), inertia * (1 + af[3:])])
         self.net_up_n = (float(v["buoyancy_mass_kg"]) - m) * float(v["gravity"])   # > 0 floats
+        self.weight_n = m * float(v["gravity"])
+        self.buoyancy_n = float(v["buoyancy_mass_kg"]) * float(v["gravity"])
+        self.r_cg = np.array(v.get("cg_minus_cb_m", [0.0, 0.0, 0.0]), dtype=float)   # CG relative to CB [m], body frame (z DOWN): CG below CB => +z => stable
         d = v["drag_lin"]
         self.D = np.array([d["X"], d["Y"], d["Z"], d["K"], d["M"], d["N"]], dtype=float)
         dq = v["drag_quad"]
@@ -52,6 +55,15 @@ class VehicleModel:
         self.cmd: Dict[str, float] = {}
         self.ext = np.zeros(6)          # external BODY-frame wrench [N, N*m]: current / bump / disturbance
         self.t = 0.0
+
+    def reset(self, pos, eul_deg) -> None:
+        """Put the vehicle back at a pose with zero velocity and idle actuators (the external push is cleared too)."""
+        self.pos = np.array(pos, dtype=float)
+        self.eul = np.radians(np.array(eul_deg, dtype=float))
+        self.nu = np.zeros(6)
+        self.ext = np.zeros(6)
+        self.rpm = {k: 0.0 for k in self.rpm}
+        self.fin_deg = {k: 0.0 for k in self.fin_deg}
 
     def set_command(self, cmd: Dict[str, float]) -> None:
         self.cmd = dict(cmd)
@@ -72,9 +84,12 @@ class VehicleModel:
         R = eul_to_rotm(np.degrees(self.eul))                       # body -> NED
         f_net_ned = np.array([0.0, 0.0, -self.net_up_n])            # NED z down: net up => negative z force
         w[:3] += R.T @ f_net_ned
+        if np.any(self.r_cg):
+            # restoring moment: weight acts at the CG, buoyancy at the CB (the origin of r_cg); with equal weight and buoyancy only the offset matters
+            w[3:] += np.cross(self.r_cg, R.T @ np.array([0.0, 0.0, self.weight_n]))
         w += self.ext
         w -= self.D * self.nu + self.Dq * np.abs(self.nu) * self.nu
-        # simple gyroscopic term for the rotation part is neglected (CG == CB, small rates)
+        # simple gyroscopic term for the rotation part is neglected (small rates)
         self.nu += dt * w / self.M
 
         phi, th, _ = self.eul

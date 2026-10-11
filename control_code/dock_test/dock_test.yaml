@@ -34,42 +34,142 @@ topics:
   actuator_cmd: /Mako_01/actuator_cmd
 
 feedforward:
-  heave_n: 7.25              # N, + = down. Cancels Mako_01's net buoyancy so a
-                             #   "do not heave" search does not float the vehicle.
-                             #   Same number as station_keeping.yaml.
+  heave_n: 0.0               # N, + = down. Equals the vehicle's net buoyancy so a "do not heave" search
+                             #   keeps its depth. 0 for the current vessel file (20 kg mass = 20 kg buoyancy,
+                             #   neutral). The old 7.25 N would sink it ~1-3 m in 5 s. Same number as station_keeping.yaml.
 
 gains:
-  elevation_n_per_rad: 40.0  # Heave force per radian of elevation. 0.1 rad
-                             #   (~6 deg) then asks for 4 N on top of the trim.
-                             #   Raise if depth matching is sluggish. Lower if
-                             #   the heave thrusters hunt.
+  # RETUNED 2026-10-08 with the closed-loop harness loop_sim.py (the real DockTestCore + allocator + full vehicle model, thruster lag, ~4.5 Hz odometry
+  # for the rates, image delay). Plants tried: nominal (thruster lag 0.2 s, image delay 0.1 s), heavy+late (0.3 s, 0.2 s, inertia x1.3), light+fast, and a
+  # STRESS plant (lag 0.45 s, delay 0.35 s, inertia x1.8, 3 Hz odometry). The thruster lag and delays are ASSUMPTIONS, which is why the stress case exists.
+  # BEFORE (pitch_nm_per_px 0.04, pitch_kd 4, no heave damping): a sustained 14 deg pitch oscillation (29 deg on the heavy plant, 52 deg on the stress plant),
+  # heave thrusters swinging +-1400 RPM, never settling. Causes: the pitch loop was too stiff for its damping (damping ratio ~0.26); the heave loop was a
+  # pure spring with no damping at all (a 20 kg vehicle with almost no drag), which the shared thrusters leak into pitch; and the hard deadband edge (below).
+  # NOW (all four plants): no oscillation, thrusters at rest, settled to within 3 deg and 0.1 m in 6-8 s. Re-run `python3 loop_sim.py` after any change here.
+  elevation_n_per_rad: 40.0  # Heave force per radian of elevation. 0.1 rad (~6 deg) asks for 4 N on top of the trim. As a spring this is ~17 N/m at the
+                             #   2.4 m standoff and ~8 N/m at 5 m (elevation = depth error / range). Doubling it doubles the spring and raises the
+                             #   heave oscillation frequency by ~40%; it needs elevation_kd below to stay damped.
+  elevation_kd_n_per_mps: 30.0 # NEW. Heave force opposing the vertical speed (N per m/s). Without it the loop is an undamped spring: depth oscillated
+                             #   +-0.07 m (nominal) and +-0.30 m (stress) forever and drove the pitch loop into a limit cycle. MEASURED (stress plant):
+                             #   0 -> depth +-0.30 m, pitch +-10 deg; 10 -> +-0.23 m / 9 deg; 20 -> +-0.16 m / 6.8 deg; 30 or more -> 0 (settles).
+                             #   On the nominal plant 10 is already enough. Analogy: a shock absorber on a car spring. Too large amplifies the
+                             #   ~4.5 Hz odometry velocity noise (60 and 100 were still fine here); 0 gives a bouncing vehicle.
   heave_max_n: 25.0          # Cap on the total heave force, including trim.
-  pitch_nm_per_px: 0.04      # Nose-down moment per pixel of dock-below-center.
-                             #   50 px -> 2 N*m. Pitch is differential heave and
-                             #   works at zero speed.
-  pitch_kd: 4.0              # N*m per rad/s of measured pitch rate. Opposes the rate.
+  pitch_nm_per_px: 0.008     # Nose-down moment per pixel of dock-below-center (was 0.04). 50 px -> 0.4 N*m. Pitch is differential heave and works at
+                             #   zero speed. This loop is a visual servo: stiffness = 0.008 x 415.7 px/rad = 3.3 N*m/rad, natural frequency ~0.95 rad/s.
+                             #   MEASURED (settle to within 3 deg and 0.1 m from an 8 deg + 0.2 m start, nominal / stress plant): 0.008 -> 7.2 / 5.9 s,
+                             #   0.012 -> 5.9 / 5.2 s, 0.02 -> 5.1 / 5.1 s. With the old hard deadband edge 0.02 was UNSTABLE on the stress plant (+-32 deg)
+                             #   and 0.012 with pitch_kd 4 oscillated +-11 deg; with the continuous deadband all of these are stable. The gain from stiffer
+                             #   is only 1-2 s, so the conservative value is kept. Raise it only together with pitch_kd, and re-run loop_sim.py.
+  pitch_kd: 8.0              # N*m per rad/s of measured pitch rate (was 4). Opposes the rate: the damping. For a damping ratio of 0.7 this loop needs
+                             #   about 2*0.7*sqrt(K*I) = 5-6 N*m/(rad/s); 8 adds margin for the stale rate sample. Too small -> oscillation (4 with
+                             #   kp 0.012: +-11 deg); too large (14+) amplifies the ~4.5 Hz rate noise and makes the heave thrusters chatter.
   pitch_max_nm: 4.0          # Leaves heave authority on the same two thrusters.
-  yaw_nm_per_px: 0.03        # Yaw moment per pixel of dock-right-of-center.
-  yaw_nm_per_lateral_px: 0.03 # Same scale for the side-midpoint cue.
-  yaw_kd: 2.0                # N*m per rad/s of yaw rate.
+  yaw_nm_per_px: 0.006       # Yaw moment per pixel of dock-right-of-center (was 0.03). 100 px (~14 deg) asks for 0.6 N*m. RETUNED 2026-10-10 with standoff_sim.py /
+                             #   tune_standoff.py (REAL core + allocator + vehicle model + the odometry sensor model: 4.5 Hz, 0.25 s late; image 15 Hz, 0.1 s late; 1 px noise).
+                             #   The old pair (0.03, kd 2) is a yaw loop with a damping ratio of ~0.15: with the delays it swings +-15 deg for ever once the heading is wrong.
+                             #   Now stiffness = 0.006 x 415.7 = 2.5 N*m/rad (natural frequency ~0.8 rad/s on the ~3.7 kg*m^2 yaw inertia) and damping ratio ~0.6.
+                             #   Costs: a slower turn. MEASURED (24 + 90 offline runs, standoff_sim.py): see the 'realign' notes under 'speed'. Halving it halves the turn rate;
+                             #   doubling it brings the swing back. Re-run tune_standoff.py after any change here.
+  yaw_nm_per_lateral_px: 0.03 # Same scale for the side-midpoint cue (unchanged: the cue is small, ~0-10 px, in the cases tested).
+  yaw_kd: 10.0               # N*m per rad/s of yaw rate (was 2). The damping. Yaw rate comes from the 4.5 Hz, 0.25 s late odometry, so there is a limit above which
+                             #   it only adds delayed noise; 4 to 12 all worked in the offline search, 2 did not.
   yaw_max_nm: 3.0            # Fin yaw moment cap. Needs forward speed to appear.
   roll_nm_per_rad: 2.0       # Hold roll at zero so the camera stays upright.
   roll_kd: 1.0
   roll_max_nm: 2.0
 
+# Deadbands are CONTINUOUS: inside the band the error counts as 0, beyond it only the part PAST the edge counts (12 px with a 10 px band acts like 2 px).
+# A hard gate (the whole value the moment it crosses the edge) turned a detector centre that flickered by ~10 px across the edge into 0.9 N steps, which the
+# allocator's square-root force-to-RPM map made +-350 RPM thruster spikes on a vehicle that was standing still (found with the viewer). Side effect: the
+# vehicle comes to rest anywhere inside the bands (about 2-2.5 deg of pitch and 6-7 cm of depth off with the shipped values): tighten a band for a tighter rest,
+# loosen it for fewer corrections.
 deadband:
-  elevation_rad: 0.02        # ~1 deg. Inside this, heave is trim only.
-  error_y_px: 10.0           # Inside this, no pitch correction.
-  error_x_px: 10.0           # Inside this, error_x does not yaw or request surge.
+  elevation_rad: 0.02        # ~1.15 deg. Inside this, heave is trim only (plus the velocity damping).
+  error_y_px: 10.0           # ~1.4 deg. Inside this, no pitch correction.
+  error_x_px: 20.0           # Inside this (~2.8 deg), error_x does not yaw (was 10). Wider because the detector centre jitters by a few pixels and the fins cannot act at rest.
   lateral_px: 8.0            # Matches the detector's lateral_exact_px starting point.
+  hold_extra_px: 41.0        # NEW 2026-10-10. Extra width of the band that decides between 'hold the standoff' (no speed) and 'creep / realign' (speed). The YAW MOMENT
+                             #   uses the narrow bands above; only the speed decision uses band + this (here 20 + 41 = 61 px, ~8.4 deg). It is a thermostat's hysteresis:
+                             #   the vehicle only starts moving to fix the heading when the error is clearly larger than what it can hold at rest.
+                             #   MEASURED offline (standoff_sim.py, 90 fresh runs: 3 plants, yaw starts -35..28 deg, lateral 0/+-0.5 m): 0 -> 7/90 runs end at rest;
+                             #   41 with the other new values -> 38/90. Smaller = tighter heading but more shuffling back and forth; larger = it rests with a bigger error.
+  # NOT a fix, tried and rejected: a deadband on the FINAL pitch moment / heave force (0.1 N*m + 0.3 N, then 0.2 N*m + 0.6 N) to stop the small thruster twitching
+  # (+-300 RPM at a few Hz while pitch moves under 1 deg and depth 4 cm). In the closed loop it made things WORSE (pitch peak-to-peak 2.6 deg, then 5.1 deg, heave
+  # RPM +-1250) because it also deadbands the damping term, so near rest the loop loses its damping. The residual twitching is small-force (a 0.1 N force is already
+  # ~170 RPM through the square-root force-to-RPM map), not a control problem.
+
+camera:
+  vfov_deg: 60.0             # VERTICAL field of view of camera_03 (three.js PerspectiveCamera). Same value as
+                             #   dock_detection.yaml camera.vfov_deg. Gives f = (height/2)/tan(vfov/2) = 415.7 px.
+                             #   Used only to turn the dock's size in the image into a distance.
+  image_height_px: 480
+
+dock:
+  radius_m: 1.0              # Radius of the circle of four lights (diameter 2 m): top/bottom at +-1 m.
+                             #   distance ~ f * radius_m / radius_px. At radius_px 200 that is 2.08 m.
+
+# SPEED LOOP. The old version pushed a fixed 4 N while misaligned and only reversed 4 N when the dock was already
+# close. With the vehicle's tiny drag (config X_u = 0.01) that left it coasting: 1.2 to 1.7 m/s at the reversal
+# point, and a 4 N reverse (0.19 m/s^2) needs 4-8 m to stop. The axial thruster can push about 90 N at 1800 RPM,
+# so the braking power exists; it just was not used. This loop commands a SPEED, never a fixed force.
+speed:
+  creep_mps: 0.45            # Closing speed while the dock is not yet square. The X-fins need flow: yaw authority is
+                             #   0.66 N*m at 0.5 m/s but only 0.24 N*m at 0.3 m/s (force grows with speed^2),
+                             #   so going much slower than ~0.5 m/s means the heading cannot be corrected.
+                             #   Faster closes in sooner but needs more braking room: stopping distance = u^2/(2*decel).
+  realign_mps: 0.55          # NEW 2026-10-10. Reverse speed used to back away from the dock when the heading is wrong at the hold distance (the stopping
+                             #   envelope allows no forward speed there, so the fins have no flow and a heading error could never be corrected: it sat there
+                             #   spinning). Backing away keeps the fins in flow; the allocator flips the fin sign for reverse flow (u*|u|). 0.55 m/s gives about
+                             #   0.8 N*m of fin yaw authority (0.3 gives 0.24). The search found 0.45-0.65 equivalent; faster needs more room behind.
+  flow_min_mps: 0.3          # NEW. If the stopping envelope allows less forward speed than this, a heading correction cannot work by creeping forward,
+                             #   so the controller backs away (mode 'realign') instead. -1 switches the whole realign behaviour OFF (the old behaviour).
+  realign_max_back_m: 2.0    # NEW. It stops backing away when the heading is square and still, or when the dock is this far beyond the hold distance
+                             #   (here about 4.3 m; the lights stay detectable out to ~8 m in the synthetic view). Larger = more time to turn, needs a longer
+                             #   clear stretch behind the vehicle and a longer cycle. Never backs away without a detected dock (search mode is unchanged).
+  settle_yaw_rate_rad_s: 0.08 # NEW. The vehicle is not 'square' while it still rotates faster than this (~4.6 deg/s): rotating with no flow cannot be stopped by the
+                             #   fins, so declaring 'standoff' while still turning leaves it spinning (seen: it kept going to 35-45 deg). 0.03 was too strict
+                             #   with the delayed odometry (the rate never read that low while moving), 0.2 lets it stop while still turning.
+  backup_mps: 0.3            # Reverse speed when the dock is too close (radius >= too_close_radius_px).
+  kp_n_per_mps: 12.0         # Axial force per m/s of speed error. 0.3 m/s too fast -> 3.6 N extra brake.
+                             #   Analogy: cruise control gain. Higher holds the speed tighter but chatters on the
+                             #   ~4 Hz odometry; lower lets speed wander.
+  max_forward_n: 6.0         # Cap on the forward push (about 0.3 m/s^2). Gentle: no surge of speed toward the dock.
+  max_brake_n: 20.0          # Cap on the reverse push used for braking (about 1 m/s^2, 22% of what 1800 RPM can give).
+  decel_mps2: 0.3            # Deceleration the approach PLANS for: allowed speed = sqrt(2*decel*(distance - stop distance)).
+                             #   Keep it well below the real braking power (max_brake_n / mass ~ 1 m/s^2) to leave margin for
+                             #   the 0.2 s thruster lag, the ~0.25 s stale odometry and the distance estimate error.
+                             #   Larger -> later braking and a faster approach; 0.3 means the vehicle starts slowing about
+                             #   0.6 m before it must stop when moving at 0.6 m/s.
+  mass_kg: 21.0              # Vehicle mass plus added mass (20 kg + ~5% surge added mass). Sets the feed-forward brake force
+                             #   mass * decel_mps2 (6.3 N at the default) that holds the planned deceleration. Too small -> the
+                             #   vehicle overshoots its stop by a few tenths of a metre; too large -> it stops short.
+  stop_margin_m: 0.3         # Extra distance kept beyond the too-close distance before the approach speed reaches zero.
+  search_mps: 0.5            # Forward speed while the detector asks for fin flow (search mode). Needs to be >= ~0.5 m/s
+  blind_max_forward_m: 0.25  # NEW. Search with NO distance known (the dock was never seen whole, or the memory expired): at most this much net forward travel, then
+                             #   mode 'search_back' reverses (backup_mps) until the whole dock is seen. The detector asks for a forward surge whenever a light is cut off
+                             #   by the frame, but forward is also where the dock is: from a close start with the dock partly out of frame (a yaw error of ~24 deg or more
+                             #   at 3 m) the old search drove the vehicle into the dock in 3 of 3 ROS runs (closest 0.14 m). -1 = no limit (the old behaviour). Smaller =
+                             #   safer but gives the fins less flow to turn. Offline, from 3 m with a yaw error of 26..35 deg: 0.25 m keeps the closest approach at 2.2-2.5 m on the nominal and light plants and 1.7 m on the heavy+late one (1.0 m: 1.4-1.7 m, no limit: through the dock).
+  blind_back_m: 1.0          # NEW. How far it backs away before the forward budget is available again (hysteresis; without it the vehicle would shuttle).
+                             #   for the fins to have full authority.
+  memory_trust_s: 20.0       # How long the last seen dock distance (dead-reckoned with the measured speed) is trusted after the lights are lost.
+                             #   While trusted, search mode never drives faster than the stopping envelope for that distance, and it backs away if the
+                             #   lights vanish inside the too-close distance (+ lost_close_margin_m). After this long the memory is dropped and the
+                             #   search may surge freely again. Too short -> forgets the dock and may surge into it after a brief dropout;
+                             #   too long -> the dead-reckoned distance drifts (odometry speed error x time), 20 s at 0.05 m/s error = 1 m.
+  lost_close_margin_m: 0.3   # Back away, instead of searching forward, if the remembered distance is below the too-close distance plus this.
+  reject_tolerance_m: 1.0    # A detection whose distance (from the radius) differs from the remembered, dead-reckoned distance by more than
+  reject_tolerance_frac: 0.5 #   max(reject_tolerance_m, reject_tolerance_frac x distance) + drift_allowance_mps x (seconds since the last good view)
+  drift_allowance_mps: 0.05  #   is treated as spurious and ignored (the controller keeps obeying the remembered distance). Seen in the closed-loop
+                             #   sim: with the glow swamping the image at ~1.3-2 m, a few blobs were reported as a dock 29 m away, and after a
+                             #   7 s dropout four blobs gave 4.4 m when the dock was 1.9 m away. Tighter -> rejects more outliers but also real
+                             #   views if the dead reckoning drifts (it is only as good as the odometry speed); looser -> lets bad views through.
+                             #   The drift term widens the gate while the memory ages: 0.05 m/s x 20 s = 1 m extra.
+  min_radius_px: 8.0         # Below this the distance estimate is not trusted (no envelope applied).
 
 limits:
-  flow_surge_n: 4.0          # Axial force while yaw needs fin flow, and the
-                             #   reverse force when the dock is too close.
-                             #   Not a closing speed. 4 N is well under the
-                             #   axial thruster's force at 1800 RPM.
-  too_close_radius_px: 200.0 # Top-bottom half-length above this means the 2 m
-                             #   dock is inside roughly 2.3 m. Surge reverses.
+  too_close_radius_px: 200.0 # Top-bottom half-length above this means the 2 m dock is inside roughly 2.1 m. Surge reverses.
   rpm_cap: 1800.0
   fin_deg_cap: 25.0
   u_fin_min_mps: 0.4

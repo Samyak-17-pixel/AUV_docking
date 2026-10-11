@@ -30,8 +30,8 @@ LIGHTS = {
 }
 
 W, H = 640, 480
-HFOV = math.radians(60.0)
-FX = (W / 2.0) / math.tan(HFOV / 2.0)
+VFOV = math.radians(60.0)                       # the sim's fov is vertical (three.js PerspectiveCamera)
+FX = (H / 2.0) / math.tan(VFOV / 2.0)           # = 415.7 px
 
 
 def _camera_axes(yaw_deg: float, pitch_deg: float, roll_deg: float):
@@ -91,7 +91,7 @@ def test_level_but_deep_keeps_zero_obliqueness():
     assert geo.spread < 2.0
     # Dock is above the camera, so the center is above the image center (smaller y).
     assert geo.center[1] < H / 2.0 - 20.0
-    fy = focal_length_px(W, 60.0)
+    fy = focal_length_px(H, 60.0)
     elev = elevation_down_rad(geo.center[1], H / 2.0, fy, 0.0)
     assert elev < 0.0
 
@@ -123,13 +123,35 @@ def test_yaw_pulls_the_side_midpoint_off_the_diameter():
     # A level yaw keeps the top–bottom line vertical. It does not show up as
     # diameter_angle. Close in, the nearer side light pulls the side midpoint
     # off that line, and the dock center leaves the middle of the image.
-    geo = _geo([3.0, 0.0, 0.0], yaw=15.0)
+    # With the real optics (f = 415.7 px) a 20 deg yaw at 3 m gives ~9.6 px (15 deg gives only ~6.7 px, under the 8 px gate).
+    geo = _geo([3.0, 0.0, 0.0], yaw=20.0)
     dx = geo.bottom[0] - geo.top[0]
     dy = geo.bottom[1] - geo.top[1]
     angle = math.degrees(math.atan2(dx, dy))
     assert abs(angle) < 2.0
     assert abs(geo.lateral_px) > 8.0
     assert abs(geo.center[0] - W / 2.0) > 40.0
+
+
+def test_guidance_centre_does_not_jump_across_the_lateral_gate():
+    """The cross-ratio centre and the diameter midpoint differ by several px in a pitched view. A hard switch between them at the lateral gate made
+    the centre flicker (the live closed loop showed ~11 px jumps), which the controller turned into thruster spikes. Sweep the yaw through the gate
+    in a pitched pose and require small steps right around the crossing."""
+    rng, height = 3.0, 0.8
+    pitch = math.degrees(math.atan2(height, rng))
+    rows = []
+    for yaw in np.arange(15.0, 30.0, 0.25):
+        try:
+            geo = _geo([rng, 0.0, height], yaw=float(yaw), pitch=pitch)
+        except AssertionError:
+            continue
+        rows.append((float(yaw), geo))
+    flips = [i for i in range(1, len(rows)) if rows[i - 1][1].center_exact != rows[i][1].center_exact]
+    assert flips, "the sweep must pass through the lateral gate"
+    i = flips[0]
+    near = range(max(1, i - 3), min(len(rows), i + 4))
+    steps = [abs(rows[k][1].center[0] - rows[k - 1][1].center[0]) + abs(rows[k][1].center[1] - rows[k - 1][1].center[1]) for k in near]
+    assert max(steps) < 4.0, steps                                 # smooth motion is ~2 px per 0.25 deg; the old hard switch jumped by several px more
 
 
 def test_roll_is_removed_before_the_diameter_angle():
@@ -187,6 +209,7 @@ def main() -> None:
         test_pitched_at_center_moves_off_the_diameter_midpoint,
         test_level_offset_shows_up_as_image_shift,
         test_yaw_pulls_the_side_midpoint_off_the_diameter,
+        test_guidance_centre_does_not_jump_across_the_lateral_gate,
         test_roll_is_removed_before_the_diameter_angle,
         test_edge_search_yaws_toward_the_light,
         test_interior_pair_nods_without_heave,

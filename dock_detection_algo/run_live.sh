@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # One-command live dock-light viewer + DockAlign publisher.
 # Prerequisite: mavsim running, camera publishing, display available.
+#   ./run_live.sh                  the two detector windows (Dock camera, Bloom mask)
+#   ./run_live.sh --align-window   ... plus the separate Dock align window (steering hints from the DockAlign message)
+#   ./run_live.sh --no-gui         publish DockAlign without windows
 set -eo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WS="$(cd "${ROOT}/../control_code/ws" && pwd)"

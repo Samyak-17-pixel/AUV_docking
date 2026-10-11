@@ -1,16 +1,31 @@
-# Ignore sibling folders not being pushed yet
+# --- Local-only sibling folders (not pushed with this repo)
 custom_auv/
 Papers/
-
-# Gate detection lives locally only (not pushed to GitHub with this repo)
 Gate-Detection/
 
-# ROS 2 / colcon build artifacts inside control_code
+# --- ROS 2 / colcon build output inside control_code
 control_code/ws/build/
 control_code/ws/install/
 control_code/ws/log/
+
+# --- Python and test caches
 **/__pycache__/
 *.pyc
 *.pyo
-.DS_Store
+.pytest_cache/
+**/.pytest_cache/
+
+# --- Everything the tools generate (logs, sweeps, detector reports, recorded runs, galleries, scratch).
+#     Regenerate with the showcase / sweep scripts; the folder itself is kept by outputs/.gitkeep.
+outputs/*
+!outputs/.gitkeep
+
+# --- Local-only notes for the AI assistant
 CLAUDE.md
+docs/project_notes.md
+
+# --- OS / editor junk
+.DS_Store
+*.swp
+.vscode/
+.idea/

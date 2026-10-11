@@ -24,10 +24,22 @@ def quat_to_roll_pitch(x: float, y: float, z: float, w: float) -> Tuple[float, f
     return roll, pitch
 
 
-def focal_length_px(image_width: int, hfov_deg: float) -> float:
-    """Pinhole fx=fy from horizontal field of view and image width."""
-    half = max(math.radians(hfov_deg) * 0.5, 1e-3)
-    return (0.5 * float(image_width)) / math.tan(half)
+def focal_length_px(image_height: int, vfov_deg: float) -> float:
+    """Pinhole fx=fy [px] from the VERTICAL field of view and the image height.
+
+    The sim renders camera_03 with a three.js PerspectiveCamera(fov, width/height, ...), whose fov is the
+    vertical one (mavsim-controller/core/visualizer_server.py, and its test_overlay_projection.py computes
+    f = (height/2) / tan(fov/2)). For 640x480 and fov 60 this gives f = 415.7 px and a horizontal FOV of
+    75.2 deg. Treating the 60 deg as horizontal (f = 554 px) makes elevations 25% too small.
+    """
+    half = max(math.radians(vfov_deg) * 0.5, 1e-3)
+    return (0.5 * float(image_height)) / math.tan(half)
+
+
+def hfov_from_vfov_deg(vfov_deg: float, image_width: int, image_height: int) -> float:
+    """Horizontal field of view [deg] for square pixels."""
+    half = math.tan(math.radians(vfov_deg) * 0.5) * float(image_width) / max(float(image_height), 1.0)
+    return math.degrees(2.0 * math.atan(half))
 
 
 def elevation_down_rad(dock_cy: float, cy_img: float, fy: float, pitch_rad: float) -> float:
@@ -69,7 +81,7 @@ def build_dock_align_msg(
     spread_align_min_px: float = 8.0,
     confidence_base: float = 0.4,
     pitch_rad: Optional[float] = None,
-    hfov_deg: float = 60.0,
+    vfov_deg: float = 60.0,
     acquire: Optional[AcquireCommand] = None,
     flow_surge_norm: float = 0.35,
 ):
@@ -139,7 +151,7 @@ def build_dock_align_msg(
         msg.elevation_valid = False
         msg.elevation_rad = 0.0
     else:
-        fy = focal_length_px(image_width, hfov_deg)
+        fy = focal_length_px(image_height, vfov_deg)
         msg.elevation_rad = float(elevation_down_rad(dock_cy, cy_img, fy, pitch_rad))
         msg.elevation_valid = True
     msg.search_yaw_norm = 0.0

@@ -1,0 +1,216 @@
+# Sim viewer + synthetic dock camera - every tunable lives here.
+#
+# WHAT THIS IS
+#   A stand-in for mavsim's camera so the REAL dock detector (dock_detection_algo/) and the dock_test controller can run in a closed loop
+#   with only the offline fake vehicle (control_code/sim_offline/). camera_node.py reads /Mako_01/odometry_sim, draws what the nose
+#   camera would see and publishes it as /Mako_01/camera_03/image/compressed (+ /Mako_01/imu_01/data).
+#
+# WHAT IS EXACT AND WHAT IS ASSUMED  (read this before trusting a detection result)
+#   EXACT (copied from "Mako (1).mavsim"): camera mounting, resolution, field of view, dock pose, light positions and lumens, beam angle.
+#   ASSUMED (my choice, NOT measured): how bright a light looks vs distance, glow size, water tint, noise. The real mavsim renderer will look
+#   different. Record a few real camera_03 frames from the live sim and tune the "look" section until detections match.
+#
+# HOW TO READ THE EFFECT NOTES
+#   "Considerable change" = a step that makes a light appear/disappear in the detector or changes its blob size by several pixels.
+#   The distances quoted come from this model's formulas with the shipped values (computed, not measured on the real renderer).
+
+node:
+  ros_domain_id: 42
+  vessel: Mako_01
+  rate_hz: 15.0            # frames per second the camera node publishes. The real sim camera is configured for 50 Hz but the bridge
+                           #   delivers far fewer. 15 is enough for the detector (it processes each new frame) and cheap to render.
+                           #   Below ~5 Hz the dock_test loop sees stale DockAlign (its timeout is 0.5 s); above 30 Hz costs CPU, no benefit.
+
+topics:
+  odometry: /Mako_01/odometry_sim
+  image: /Mako_01/camera_03/image/compressed
+  imu: /Mako_01/imu_01/data
+
+# ---------------------------------------------------------------------------
+# EXACT: the nose camera (sensor_id 3, topic camera_03)
+# ---------------------------------------------------------------------------
+camera:
+  location_m: [0.575, 0.0, 0.0]          # in the body frame (x fwd, y stbd, z down); 0.575 m ahead of the vehicle origin = the nose
+  orientation_deg: [-90.0, 0.0, 90.0]    # [roll, pitch, yaw] applied Z-Y-X, three.js camera convention (looks down its -Z, +X right, +Y up).
+                                         #   With these numbers the optical axis is body +x (forward) and image-right is body +y (starboard).
+  width: 640
+  height: 480
+  vfov_deg: 60.0                         # VERTICAL field of view (the sim uses a three.js PerspectiveCamera). f = (height/2)/tan(vfov/2) = 415.7 px,
+                                         #   horizontal FOV 75.2 deg. A change of 10 deg moves a point 100 px off-center by about 3 deg.
+  jpeg_quality: 80                       # same as the sim's camera_config. Lower -> blockier glow edges; 40 would visibly smear small lights.
+
+# ---------------------------------------------------------------------------
+# EXACT: the dock (dock_02) and its lights
+# ---------------------------------------------------------------------------
+dock:
+  position_m: [10.0, 0.0, 3.0]           # NED. The ring of lights lies in the plane x = 10; the funnel body extends from there to x = 12.5.
+  orientation_deg: [0.0, 0.0, 180.0]     # yaw 180: the dock mouth faces the vehicle (toward -x).
+  # Light positions are in the DOCK frame (x out of the mouth, y right, z down). Top and bottom are a vertical diameter of the 1 m circle;
+  # the two side lights sit 45 deg either side of the top, both above the centre.
+  ring_lights:
+    - {name: top,    loc: [0.0,  0.0,   -1.0],   lumens: 20000}
+    - {name: bottom, loc: [0.0,  0.0,    1.0],   lumens: 20000}
+    - {name: right,  loc: [0.0,  0.707, -0.707], lumens: 2000}
+    - {name: left,   loc: [0.0, -0.707, -0.707], lumens: 2000}   # side lights are 10x DIMMER than top/bottom in the vessel file
+  # Two big floods that only illuminate the scene (50000 lm, 179 deg beam). Whether the real renderer draws them as bright points is unknown.
+  scene_floods:
+    - {loc: [1.0, 0.0, -2.0], lumens: 50000}
+    - {loc: [0.0, -4.0, -2.0], lumens: 50000}
+  draw_scene_floods: false               # true adds them as bright dots. They could be mistaken for ring lights by the detector: try it to see.
+  beam_angle_deg: 82.0                   # the ring lights shine out of the mouth in a cone this wide (full angle).
+  use_beam_pattern: true                 # true: a light fades out when you look at it from outside its cone (from the side or behind the dock).
+                                         #   false: always visible (unrealistic but makes testing detection from odd angles possible).
+
+# ---------------------------------------------------------------------------
+# ASSUMED: what the lights look like
+# ---------------------------------------------------------------------------
+look:
+  ref_distance_m: 5.0                    # A 20000 lm light seen from this distance has brightness 1.0. Pure bookkeeping: change it together with core_gain.
+  core_gain: 12.0                        # Peak pixel value = min(1, core_gain * brightness). Brightness falls as lumens/distance^2, so the 10x dimmer
+                                         #   side lights drop below the detector's brightness threshold (v_thresh 180 = 0.71) at a camera-to-lamp
+                                         #   distance of 5.9 m (computed), while top/bottom stay saturated out to 15.3 m.
+                                         #   MEASURED with the real detector and its shipped settings (JPEG q80, noise on): all four lights are found
+                                         #   from 2.5 m to 8 m (the halo keeps the side lights alive a little past 5.9 m), only the two bright lights
+                                         #   are found at 10 m and beyond, so DockAlign is invalid there.
+                                         #   Doubling core_gain moves the side-light limit out by about 40% (to ~11 m); halving it pulls it in to ~5 m.
+                                         #   THIS IS THE KEY KNOB for how far away the detector can find all four lights.
+  water_attenuation_per_m: 0.04          # Brightness is multiplied by exp(-this * distance). 0.04 -> 13% less at 3.5 m, 33% less at 10 m. 0 = clear.
+  light_radius_m: 0.05                   # Physical radius of a lamp. The sharp bright core is at least this big in pixels: f*radius/distance
+                                         #   (4.2 px at 5 m, 8.3 px at 2.5 m). Always at least 1.5 px.
+  bloom_sigma_px: 3.0                    # Halo size (Gaussian sigma, px) of a lamp at brightness 1.
+  bloom_sigma_gain: 5.0                  # The halo grows with log2(1 + brightness): px added per doubling. A big value makes close lamps swell into
+                                         #   one blob (cores merge), which is exactly what the detector's peak mode is built for.
+  bloom_amplitude: 0.7                   # Halo strength relative to the core. 0 = no halo (hard dots); 1.5 = heavy fog-like glow.
+  color_bgr: [1.0, 0.95, 0.8]            # Colour of the lamp core (5700 K white, slightly warm).
+  halo_bgr: [1.0, 0.9, 0.55]             # Colour of the halo: cyan/teal tint of lit water. The detector accepts hue 80-110 as 'cyan assist'.
+  background_bgr: [0.16, 0.07, 0.02]     # Water colour with no light (0-1). Brighter background -> more false mask pixels; > 0.4 floods the mask.
+  noise_sigma: 0.012                     # Gaussian sensor noise (fraction of full scale). 0.012 = 3 grey levels. > 0.05 makes the mask speckle.
+  seed: 7                                # Noise seed (fixed so tests are repeatable). Use -1 for a different noise every frame.
+
+# ---------------------------------------------------------------------------
+# ASSUMED: image degradations for robustness testing (synthetic_camera.py _apply_stress). ALL OFF by default: nothing here changes the normal frames.
+# Used by dock_detection_algo/reliability_study.py and terminal_docking_control/docking_sweep.py to ask "does the detector still work when ...".
+# The shapes are guesses at what a real renderer / real water could do; the real mavsim look is not known.
+# ---------------------------------------------------------------------------
+stress:
+  seed: 11                               # random placement of bubbles / specks / distractors (fixed = repeatable)
+  blur_sigma_px: 0.0                     # Gaussian blur of the whole frame (turbid water, defocus). 1-2 px is mild, 4+ px smears the side lights into the halo.
+  motion_blur_px: 0                      # streak length of motion blur [px] (0 = off) and its direction
+  motion_blur_deg: 0.0
+  backscatter: 0.0                       # 0..1: bright veil that fades from the top of the image to the bottom (sun / scattered light). 0.3 lifts the top rows to ~0.3 brightness.
+  bubbles: 0                             # bubbles per frame: soft bright discs 1.5-5 px radius at random places
+  bubble_brightness: 0.6                 # peak brightness of a bubble (0..1)
+  snow: 0                                # marine-snow specks per frame (0.6-1.4 px radius)
+  distractors: 0                         # extra bright point lights per frame at random places (a false 'ring light')
+  glint: 0.0                             # 0..1 strength of bright patches near the top of the image (the sun on the surface seen from below)
+  reflections: 0                         # number of ring lights mirrored about the image centre line (a reflection)
+  occlude: ""                            # name of a ring light hidden from the frame ('top' 'bottom' 'left' 'right'; '' = none)
+
+# ---------------------------------------------------------------------------
+# SEA FLOOR (terrain.py) shared by the 3D view, the side-scan sonar and the tests. ALL numbers are ASSUMPTIONS (the real sea floor is not known).
+# ---------------------------------------------------------------------------
+terrain:
+  seed: 5                                # same seed = same sea floor in every process
+  size_m: 300.0                          # square area [m], centred on center_m (north, east). The sonar reaches 30-150 m, so it is big.
+  center_m: [0.0, 0.0]
+  dx_m: 0.25                             # grid cell [m]. Finer = sharper shadows and ripples, more memory (1200 x 1200 cells at 0.25 m).
+  depth_m: 14.0                          # mean floor depth [m] (the vehicle swims at 3 m: the altitude is 5-20 m)
+  relief_m: 5.0                          # vertical amplitude of the fractal relief [m]; 0 = flat (what the sonar tests use)
+  min_depth_m: 5.0
+  max_depth_m: 26.0
+  ridges: 0.35                           # weight of the sharp rock crests
+  trenches: 7                            # grooves up to trench_depth_m deep
+  trench_depth_m: 3.5
+  boulders: 320                          # boulders 0.4-1.7 m radius on the rock and gravel areas (they cast shadows)
+  ripples_m: 0.04                        # sand ripples amplitude [m]
+  objects: true                          # man-made objects: container, block, slab, a pipeline (terrain.py DEFAULT_OBJECTS)
+  dock_xy_m: [10.0, 0.0]                 # a calm, gently sloping patch round the dock keeps the docking world unchanged
+  dock_floor_depth_m: 11.0
+  calm_radius_m: 24.0
+  refl_db: {mud: -33.0, sand: -27.0, gravel: -22.0, rock: -17.0, object: -9.0}   # Lambert backscatter per surface class at 450 kHz [dB] (ASSUMED typical values)
+
+# ---------------------------------------------------------------------------
+# SIDE-SCAN SONARS (synthetic_sidescan.py, sidescan_node.py): a pair of Cerulean Omniscan 450 SS, port and starboard. Datasheet: 450 kHz, 0.5 x 50 deg beam, up to 150 m,
+# 200-1200 range bins, ping rate up to 20 Hz, gain 0-7 or auto. Levels, noise and gain steps are ASSUMED (no real recordings were available).
+# ---------------------------------------------------------------------------
+sonar:
+  topics: {port: /Mako_01/sonar_01/ping, starboard: /Mako_01/sonar_02/ping, altimeter: /Mako_01/altimeter/range, status: /Mako_01/sonar/status, cmd: /Mako_01/sonar/cmd}
+  sensor:
+    mount_from_nadir_deg: 30.0           # beam axis tilted this far from straight down toward the transducer's side (port left, starboard right). 30 = mostly downward.
+    location_m: [0.0, 0.0, 0.09]         # body frame (x forward, y starboard, z down): longitudinal centre, on the belly
+    beam_across_deg: 50.0                # -3 dB width of the fan across track: the swath covers (mount - 25) to (mount + 25) degrees from the nadir = 5 to 55 deg
+    beam_along_deg: 0.5
+    range_m: 30.0                        # default range per side; change it live in the viewer's Sonar tab (2-150 m)
+    num_bins: 600                        # 200-1200 (the Omniscan's num_results)
+    gain_index: -1                       # -1 = auto, 0..7 manual (6 dB per step, ASSUMED)
+    sound_speed_mps: 1500.0              # sea water 15 deg C
+    absorption_db_per_m: 0.10            # at 450 kHz in sea water (fresh water is about 0.03)
+    looks: 3.0                           # speckle: fewer looks = grainier
+    seed: 1
+
+# ---------------------------------------------------------------------------
+# THE VIEWER WINDOW (viewer_app.py)
+# ---------------------------------------------------------------------------
+viewer:
+  assets:
+    vessel_file: ""                    # path to the .mavsim archive holding the STL meshes; "" = the first "Mako*.mavsim" next to the repo.
+                                       #   If none is found the scene uses a plain torpedo and cone, so the viewer still runs.
+    vehicle_reduction: 0.90            # Fraction of the vehicle mesh faces removed (147k faces -> ~15k at 0.90, 0.3 s to load). Higher is faster
+                                       #   but facets show; 0.98 looks blocky, 0.5 costs ~2 FPS on a laptop GPU. Dock mesh is small and kept whole.
+  window:                              # starting window size [px]; the viewer never opens larger than 97% x 95% of the screen (a 1920x1080 screen gets 1800x1000)
+    width: 1800
+    height: 1000
+  refresh_hz: 25.0                     # 3D view and HUD update rate. 25 is smooth; 10 saves CPU, above 40 gains nothing (the monitor is ~60 Hz and
+                                       #   the real odometry arrives at ~4 Hz anyway).
+  plot_refresh_hz: 4.0                 # Plots redraw rate. matplotlib redraws are the expensive part: 4 Hz is fine for reading, 10 Hz starts to lag.
+  plot_window_s: 60.0                  # Seconds of history in the plots. Longer shows whole manoeuvres but compresses fast changes.
+  extrapolate_s: 0.4                   # The vehicle is moved forward with its own velocity for at most this long between odometry samples, so the
+                                       #   view does not jump at the real sim's ~4 Hz. 0 = show raw samples (stair-steps). > 0.6 can overshoot when the
+                                       #   vehicle stops or turns: the picture then snaps back.
+  trail_points: 1500                   # Length of the path drawn behind the vehicle (a point is added every `trail_step_m`).
+  trail_step_m: 0.03                   # Minimum distance between trail points. Smaller = smoother but heavier.
+  water_surface: true                  # Translucent plane at depth 0 so you can see how close to the surface the vehicle is.
+  grid:
+    z_m: 8.0                           # Depth of the reference grid ("seabed" for scale only; the real water depth is infinite in the config).
+    x_range_m: [-2.0, 16.0]
+    y_range_m: [-6.0, 6.0]
+    spacing_m: 1.0                     # 1 m squares: handy to read the 2.4 m standoff or a 0.8 m lateral offset by eye.
+  thrust_arrows:
+    enabled: true
+    max_length_m: 0.5                  # Arrow length at `rpm_ref`. Pointing along the thrust the thruster is producing (negative RPM flips it).
+    rpm_ref: 1800.0                    #   Arrows show the thrust FORCE direction: the heave thrusters point UP at positive RPM, so a dive (negative RPM) draws them pointing down.
+    min_rpm: 20.0                      # Smaller commands are not drawn.
+  auto_record: true                    # Record every controller run to outputs/sim_viewer_runs/auto_<controller>_<time>.csv (History tab lists, replays and compares them).
+                                       #   Starts when a controller is seen running and stops 3 s after it ends. Runs under 10 samples are discarded. false = never write files.
+  hud: true                            # Heads-up display on the 3D view (depth, heading, speed, dock range/bearing, controller phase), the top-view minimap
+                                       #   in its corner and the detected-light markers on the camera pane. false = plain 3D view.
+  look3d:                              # the underwater look of the 3D view (decoration only: nothing here changes the simulation or the camera images)
+    enabled: true                      # false = the old plain scene (grid + translucent surface). Costs ~10 ms per frame on a laptop GPU when on.
+    seed: 3                            # same seed = same sea floor every start. Any integer gives a different (equally artificial) terrain.
+    use_terrain: true                  # the floor is the SHARED rugged terrain of `terrain:` (the one the side-scan sonar maps; 1 m mesh). false = the old small decorative floor.
+    floor: true                        # Sea floor mesh with procedural sand, ripples and rock crests, rougher away from the approach corridor.
+    floor_depth_m: 11.0                # NED depth of the floor in the middle. Only for scale: the real mavsim scene's floor depth is not known here.
+    floor_relief_m: 1.2                # Height of the hills and rocks. 0 = flat; > 2 m starts to poke into view near the dock.
+    floor_resolution: 160              # Grid points per side (160 x 160 = 51k triangles). 100 is blockier and a bit faster; 250 is smooth but ~2x slower.
+    sand_color: [168, 160, 128]
+    rock_color: [96, 98, 100]
+    surface_waves: true                # Rippling water surface seen from below (the vehicle is at 3 m depth, so it is visible overhead).
+    wave_height_m: 0.08                # Wave amplitude. 0.3+ looks like a storm.
+    surface_opacity: 0.32
+    light_shafts: true                 # Faint slanted sun rays from the surface.
+    shaft_opacity: 0.045               # 0.02 = barely visible, 0.1 = strong "god rays".
+    dock_light_cones: true             # Pale cones of light from the four dock lights (beam angle from the vessel file: 82 deg).
+    cone_opacity: 0.05
+    particles: true                    # 'Marine snow': slowly drifting specks around the vehicle, they give a sense of speed and water.
+    particle_count: 700
+    shadow: true                       # Soft shadow of the vehicle on the sea floor.
+    hide_reference_grid: true          # Hide the old 1 m grid and flat surface plane when the look above is on (the grid is still handy to read distances: set false).
+  show_camera_frustum: true            # Wire pyramid of the nose camera's field of view (60 deg vertical, 75 deg horizontal), 1.2 m deep.
+  colors:
+    vehicle: [0.95, 0.55, 0.10]
+    ghost: [0.75, 0.90, 1.0]           # translucent 'where the MODEL says the vehicle is' copy in the real-vs-model overlay (--replay FILE --overlay)
+    dock: [0.55, 0.65, 0.75]
+    light: [1.0, 0.95, 0.5]
+    trail: [0.2, 1.0, 0.6]
+    background_top: [0.03, 0.14, 0.26]
+    background_bottom: [0.02, 0.07, 0.14]

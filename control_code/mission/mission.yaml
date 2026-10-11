@@ -1,0 +1,118 @@
+# Mission controller - lawnmower / orbit / spiral / yo-yo / go-to / hold / return-home legs, chained in one YAML. All tunable parameters live here.
+# Frame: NED (x forward North, y East, z positive down). Actuator commands in sim units: th_XX = RPM, cs_XX = degrees (0 = stop/centred).
+#
+# Engine: mission_core.MissionRunner (pure Python) drives waypoint_tracking_core.WaypointTracker (verified closed-loop offline) leg by leg; paths.py builds the legs.
+# Straight legs are flown as LINES with cross-track control (cross_track below). NOT run on the real sim: the 2.5 m turning circle, fin signs and the thrust law are
+# offline ASSUMPTIONS (docs/project_notes.md section 8). Re-measure the turning circle live (dof_testing yaw step) before trusting lane spacings.
+# The dock sits at (10, 0, 3): the geofence and dock_keepout_m below keep surveys away from it.
+
+node:
+  name: mission
+  vessel: Mako_01
+  rate_hz: 20.0
+  ros_domain_id: 42
+
+topics:
+  odometry: /Mako_01/odometry_sim          # nav_msgs/Odometry
+  actuator_cmd: /Mako_01/actuator_cmd      # interfaces/Actuator
+
+mission:
+  acceptance_radius_m: 0.5   # a path point counts as reached inside this horizontal radius AND depth_acceptance_m (a leg can override with acceptance_m).
+                             #   Smaller = more precise but the vehicle cannot strafe, so it slows and turns more to hit it; 0.2 m is demanding, 1 m is easy.
+                             #   Also forgives that much when the path is checked against the turning circle. Analogy: the size of the goal mouth.
+  depth_acceptance_m: 0.25
+  hold_depth_m: 3.0          # depth used for a leg written without z
+  home: null                 # [x, y, z] to return to; null = where the mission started
+  zero_on_exit: true         # publish neutral when the node exits
+
+# LEGS, flown in order. Types: goto, lawnmower, orbit, spiral, yoyo, hold, return_home. Every leg may add acceptance_m, depth_acceptance_m, speed_mps.
+#   lawnmower: lanes of length_m along heading_deg (0 = north, 90 = east) from `origin`, lane spacing_m apart to the RIGHT of the heading, over width_m.
+#              A straight run-in of leadin_m (default 2 x turn radius) before the first lane lines the vehicle up: it cannot turn on the spot. Leave room for it.
+#              The U-turns are semicircles of diameter = the sideways step and bulge a step/2 PAST the lane ends: leave that room (and stay clear of the dock).
+#              spacing_m < 2 x speed.turn_radius_m (5 m) -> lanes are visited with a skip (0, 2, 4, .. then 1, 3, ..); needs >= 5 lanes to avoid a 1-lane step.
+#              depths: [3, 4] flies the lanes at each depth in turn (back and forth) - a stepped survey.
+#   orbit:     circle around centre; radius_m >= 1.1 x turn radius; revs revolutions; clockwise seen from above; start_deg = bearing centre -> first point (180 = south).
+#   spiral:    r_start_m -> r_end_m, pitch_m of radius per revolution (= the swath gap between turns).
+#   yoyo:      from -> to with the depth swinging z_top <-> z_bottom, `cycles` periods (depth_acceptance_m defaults to 0.6: the extremes are targets to swing to).
+#   hold:      seconds with the thrust stopped and depth held (no heading hold: the fins need flow).
+#   return_home: go to mission.home and stay there (hold).
+# NOTE the legs are CHAINED: the vehicle cannot turn on the spot (turning circle ~2.5 m), so each leg must start roughly where and the way the previous one ended.
+# Here: the run-in of the lawnmower starts at the vehicle's start (0,0) heading north and curves right onto the first lane (east); the orbit starts ahead of the last lane's end
+# (east); the yo-yo continues east; return_home is a wide U-turn (it needs the room: validate_mission/the Config tab warn when a turn would leave the geofence).
+# leadin_m: 8 on the lawnmower below: with REALISTIC odometry (4.5 Hz, 0.25 s late) the default run-in of 2 turning radii (5 m) left the first lane 1.9 m off (95th percentile),
+# 8 m gives 0.65 m (mission_showcase.py); 12 m leaves the geofence.
+legs:
+  - {type: lawnmower, origin: [0.0, 5.0], heading_deg: 90.0, length_m: 10.0, width_m: 16.0, spacing_m: 8.0, z: 3.0, leadin_m: 8.0}
+  - {type: orbit, centre: [-20.0, 19.0], radius_m: 4.0, revs: 1.0, clockwise: true, start_deg: 0.0, points_per_rev: 12, z: 3.0}
+  - {type: yoyo, from: [-16.0, 19.0], to: [-16.0, 28.0], z_top: 2.0, z_bottom: 4.0, cycles: 2}
+  - {type: return_home}
+
+cross_track:
+  enabled: true              # fly straight legs as lines (the lane), not just towards the next point. false = aim at the next point only (drifts off the lane in a current/push).
+
+speed:
+  cruise_mps: 1.0            # top speed between waypoints [m/s]. Fin authority and heading-loop quality grow with speed (MEASURED in station_keeping.yaml: a 30 deg
+                             #   heading step settles in ~4 s at 0.8 m/s, 3 s at 1-1.5 m/s, and does not respond at all below ~0.15 m/s). Faster = shorter mission,
+                             #   longer stopping distance (0.5 v^2 / decel_mps2) and bigger overshoot of a waypoint.
+  flow_mps: 0.6              # lowest speed kept while moving between waypoints, and the speed used while turning a large angle. The X-fins need flow: 0.3 m/s gives
+                             #   only 0.24 N*m of yaw, 0.5 gives 0.66, 1.0 gives 2.65. Too low = the vehicle cannot complete a turn; high = a wide turning circle.
+  turn_radius_m: 2.5         # the smallest circle the vehicle can drive [m], MEASURED offline (orbiting an unreachable waypoint: diameter ~4.9 m). It does not depend on speed:
+                             #   the fin moment and the hull's yaw drag both grow with speed^2. Used only for the start-up warning about unreachable corners; it is NOT a control
+                             #   parameter. It grows with a lower fin_deg_cap (limits) and with a larger yaw inertia; re-measure on the real sim.
+  decel_mps2: 0.3            # planned deceleration of the slow-down law v = sqrt(2 * decel * (distance - acceptance)). Keep it well below what the thruster can do
+                             #   (limits: about 1 m/s^2 at 20 N) so the 0.2 s thruster lag and the 0.25 s late odometry do not make it overshoot the last waypoint.
+  lookahead_m: 4.0           # line legs: aim at the point this far AHEAD of the vehicle's projection on the lane (pure pursuit). Larger = smoother, cuts corners and converges slowly
+                             #   onto the lane (a 3 m offset needs ~2x this to settle); smaller = tight but weaves (below ~2 m it oscillates). ~1.5 x the turn radius is a good start.
+  align_deg: 25.0            # heading error above which the speed target is exactly flow_mps (turn while moving, do not stop). Below it the speed is blended towards
+                             #   zero with cos(error). 25 deg ~ 10% speed loss. Larger = keeps driving faster while still turning (wider arcs).
+
+# GAINS. error = setpoint - measurement. Outputs: heave/speed in N, yaw in N*m. The D term uses the MEASURED rate. Same loops and numbers as station_keeping.yaml (documented
+# there with the measured effect of each change); heave is the softer hold gain, yaw is the heading hold that settles a 30 deg step in ~4 s at 0.8 m/s.
+gains:
+  heave: {kp: 6.8, ki: 0.5, kd: 25.0, i_max: 10.0, max: 25.0, lpf_tau_s: 1.1, sp_tau_s: 3.0}      # N per m of depth error ... (see station_keeping.yaml)
+  yaw:   {kp: 3.0, ki: 0.0001, kd: 3.6, i_max: 0.5, max: 3.0, lpf_tau_s: 0.2}                     # N*m per rad of heading error ...
+  speed: {kp: 25.0, ki: 4.0, kd: 0.0, i_max: 15.0, max: 30.0, sp_tau_s: 1.5}                      # N per m/s of speed error; sp_tau_s smooths speed steps (no 50% overshoot)
+  cross_track: {kp: 0.05, ki: 0.01, kd: 0.0, i_max: 0.2, max_heading_deg: 15.0}                 # TRIM on top of the lookahead carrot: heading offset in rad per m off the lane (0.05 = 2.9 deg per m), capped at max_heading_deg. The integral (ki, per m*s) cancels a steady push (current) in ~20 s: raise it for a stronger current, lower it if the vehicle weaves along the lane. 0 = pure carrot following.
+
+feedforward:
+  heave_n: 0.0               # N (+ = down) = the vehicle's net buoyancy. 0 for the current neutral 20 kg vessel file (see station_keeping.yaml).
+
+limits:
+  rpm_cap: 1800.0            # soft cap on every thruster [RPM] (hardware 2668)
+  small_force_n: 0.3         # linear force-to-RPM map below this force (see station_keeping.yaml for the measured chatter reduction)
+  fin_deg_cap: 25.0          # soft cap per fin [deg] (hardware +-35)
+  u_fin_min_mps: 0.4         # speed floor of the 1/speed^2 fin gain schedule
+  u_fin_off_mps: 0.15        # below this forward speed the fins are forced to zero
+  u_fin_full_mps: 0.5        # above this the fins have full authority
+
+estimator:                   # common/pose_filter.py: smooth, up-to-date state from the slow (4.5 Hz), late (0.25 s), noisy odometry; frozen odometry -> neutral
+  filter: true
+  odom_latency_s: 0.25
+  accel_noise_lin: 0.25
+  accel_noise_ang: 0.8
+  pos_sigma_m: 0.015
+  ang_sigma_rad: 0.0044
+
+terrain_follow:              # hold a fixed altitude above the sea floor (needs the altimeter: /Mako_01/altimeter/range from the simulated sonar node). Replaces the legs' z.
+  enabled: false
+  altitude_m: 6.0            # wanted height above the floor [m]
+  rate_mps: 0.4              # fastest change of the depth target [m/s]
+  max_depth_m: 20.0          # never deeper than this [m] (the floor can be deeper)
+
+safety:
+  min_depth_m: 0.4
+  max_depth_m: 20.0
+  max_pitch_deg: 60.0
+  max_roll_deg: 60.0
+  odom_timeout_s: 0.5
+  dock_keepout_m: 6.0        # entering this circle around the dock (10, 0) aborts the mission and the vehicle returns home. 0 = off. The vehicle needs about 2 turning radii (5 m) to
+                             #   turn back, so set it to the closest approach you accept PLUS ~3 m: with 3.0 a vehicle at 1 m/s heading at the dock still reached the dock after the abort. Also applied to every path point.
+  geofence: {x_min: -30.0, x_max: 8.0, y_min: -8.0, y_max: 32.0, z_min: 0.4, z_max: 12.0}    # leaving this box aborts to return-home (once). Remove a key to drop that side.
+  failsafe:
+    odom_loss_s: 15.0        # odometry gone longer than this (then back) -> abort to return-home. Real-sim freezes last 5-25 s: lower = aborts on more freezes.
+
+survey:
+  swath_width_m: 3.0         # width of the sensor footprint on the sea floor [m], used only for the coverage plot in the viewer (not for control)
+
+logging:
+  status_period_s: 2.0

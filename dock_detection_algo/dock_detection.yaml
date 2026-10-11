@@ -14,6 +14,40 @@
 #   * Pipeline order:  bloom mask -> core peaks (DoG + distance transform + NMS)
 #                      -> label T/B/L/R -> alignment errors / confidence.
 
+# ===========================================================================
+# TUNING STATUS (2026-10-10) - READ THIS FIRST
+# ===========================================================================
+# Thresholds were tuned with dock_detection_algo/tune_detection.py on SYNTHETIC frames (control_code/sim_viewer/camera/synthetic_camera.py): 900 random poses
+# (range 2.5-10.5 m, bearing, pitch +-10, roll +-12, depth offset) x random 'looks' of the lights (brightness 0.45-2.2x, glow size, noise, water clarity,
+# side lights 0.4-4x, and in 30% of the frames a 2-5x brighter, noisier "murky" background), passed through JPEG. A frame is GOOD when the detector says valid with
+# four lights, each within 6 px (0.8 deg of bearing) of its true position; BAD LOCK = valid but a light is wrong (dangerous: a controller would steer on it).
+#                                clear water             murky water (4x background)    mixed (30% murky)
+#   shipped values (before)      GOOD 56%  BAD LOCK 17%    GOOD 54%  BAD 36%                GOOD 54%  BAD 24%
+#   these values (after)         GOOD 89%  BAD LOCK  2%    GOOD 83%  BAD 15%                GOOD 92%  BAD  5%
+#   (independent fresh frames the search never saw; by range, clear water: 2.5-4 m 94%, 4-6 m 98%, 6-8 m 94%, 8-10.5 m 73% good - beyond ~8 m the dim side lights fade and a
+#    valid 4-light lock is rare; the docking controller does not need it there: it remembers the dock.)
+# THESE NUMBERS ARE SYNTHETIC-ONLY EVIDENCE. The real renderer's glow, noise and water colour are not known: several values moved to the edge of what the synthetic
+# frames allow (low brightness floors, wide DoG scale), which is only safe if the real background is dark. Before trusting them: record real camera_03 frames
+# (control_code/sim_viewer/data/record_run.py --frames 10) and re-run `python3 tune_detection.py report` on a dataset built from them, or tune with the trackbars (key 'p').
+# If you see false lights (reflections, murk) raise peak_abs_v_floor to 120-160 and peak_abs_v_frac to 0.7 (the old values): that costs about 12 points of recall at 8-10 m.
+#
+# MEASURED SENSITIVITY around the tuned point (500 mixed frames; each row: GOOD% / BAD-LOCK% when the value is changed):
+#   v_thresh 110          x0.5: 87/8   x1.5 (165): 85/9      -> hardly matters here (the peak finder, not the mask, decides); raise it with murky water
+#   close_k 10            x0.5: 86/9   x1.5: 86/8             -> no effect between 5 and 15 px
+#   open_k 3              1: 87/9      5: 84/9                -> every +2 costs ~2 points
+#   min_area 20           10..30: no change                   -> only used when peak_mode finds no peaks
+#   peak_sep 25           12: 86/8     38: 84/11              -> +50% costs 2 points GOOD and adds 2.6 points BAD LOCK (neighbouring lights get merged)
+#   core_pct 82           41..62: 87/9   102+: 74/12          -> above ~90 recall drops 12 points (clamped to >= 80 by the code)
+#   tight_floor 140.6     70: 85/9     175: 85/7   210: 76/12 -> above ~190 recall drops 10 points
+#   response_min 0.05     0.025..0.075: no change
+#   peak_abs_v_floor 80   40-60: 87/8  100: 81/8  120: 77/8   -> +25 grey levels = -5 points GOOD (far, dim lights vanish); no effect on BAD LOCK in dark water
+#   peak_abs_v_frac 0.525 0.26-0.39: 87/8  0.66: 82/8  0.79: 78/8 -> same story as the floor
+#   dog_sigma_small 2.34  1.17: 84/11  2.9: 86/9  3.5: 87/8  -> sharper = noisier peaks (+3 points BAD LOCK at half)
+#   dog_sigma_large 15    5: 80/15  7.5: 82/12  12.5: 89/7  15: 91/5 -> the strongest knob: it should match the bloom radius (3-25 px here); halving it triples the bad locks
+#   tight_erode_k 3       1: 86/8      3: 87/7                -> 3 is slightly better than 1 or 2
+#   search_dilate_k 9     3..15: no change
+# ===========================================================================
+
 camera:
   # CompressedImage topic. Override on CLI with --topic.
   topic: /Mako_01/camera_03/image/compressed
@@ -22,14 +56,24 @@ camera:
   # Leave "" to derive /<vessel>/imu_01/data. Roll is removed before labelling;
   # pitch is added to the pixel angle to get the dock center's elevation.
   imu_topic: ""
-  # Horizontal field of view of camera_03 in the sim (square pixels assumed).
-  hfov_deg: 60.0
+  # NEW 2026-10-10. Sign applied to the IMU roll / pitch before use (+1 or -1). The code assumes the IMU orientation is in the SAME convention as
+  # /Mako_01/odometry_sim (NED world, body x fwd / y starboard / z down, positive pitch = nose up). That is UNVERIFIED on the real sim. If an
+  # ROS-style ENU/FLU IMU is used, pitch (and roll) come out with the opposite sign: run `python3 check_imu_convention.py` on the live sim and set -1 here
+  # if it says FLIPPED. A wrong pitch sign makes the elevation error (heave command) wrong by TWICE the pitch: a vehicle pitched 5 deg up would be told
+  # the dock is 10 deg higher than it is.
+  imu_roll_sign: 1
+  imu_pitch_sign: 1
+  # VERTICAL field of view of camera_03 in the sim (square pixels assumed). The sim draws the image with a
+  # three.js PerspectiveCamera, whose fov is vertical: 640x480 at 60 deg gives f = 415.7 px and a horizontal
+  # FOV of 75.2 deg. (This used to be "hfov_deg: 60", which made the elevation 25% too small.)
+  # Changing it by 10 deg moves the computed elevation of a dock 100 px below center by about 3 deg.
+  vfov_deg: 60.0
 
 # ---------------------------------------------------------------------------
 # 1) BLOOM MASK  (which pixels count as "light glow")
 # ---------------------------------------------------------------------------
 mask:
-  v_thresh: 180             # HSV Value (brightness, 0-255) floor for a pixel to be "light".
+  v_thresh: 110             # [TUNED 2026-10-10, was 180]  HSV Value (brightness, 0-255) floor for a pixel to be "light".
                             #   UP   -> mask shrinks to only the brightest pixels; dim/far lights vanish.
                             #   DOWN -> more glow, water murk and reflections leak in; blobs merge.
                             #   Effect size: ~+/-15 (about 6% of range) changes glow radius by roughly
@@ -50,13 +94,20 @@ mask:
   open_k: 3                 # Morphological OPEN kernel (px, forced odd). Deletes specks smaller than
                             #   this. 0 disables. Each +2 removes noise ~2 px wider but shrinks small
                             #   real lights; >9 can erase a distant light (light diameter < kernel).
-  close_k: 7                # Morphological CLOSE kernel (px, forced odd). Fills holes/gaps up to this
+  close_k: 10                # [TUNED 2026-10-10, was 7]  Morphological CLOSE kernel (px, forced odd). Fills holes/gaps up to this
                             #   size and merges neighbouring blobs closer than ~k px. 0 disables.
                             #   +4 -> lights within ~4 px more get bridged; >21 tends to glue the
                             #   whole dock into one blob (cores then rely on peak_mode).
   min_area: 20.0            # Smallest blob (px^2) kept in blob mode / fallback. 20 ~ a 5 px dot.
                             #   x2 removes dots up to ~7 px across; 200 removes anything under ~16 px.
                             #   No effect when peak_mode finds peaks (only used in fallback).
+  bg_subtract: true         # [NEW 2026-10-11] Remove the water's own brightness (per image row) above bg_ref_v before thresholding. In clear water (rows darker than
+                            #   bg_ref_v) NOTHING changes. In murky water (background 3-5x brighter) or with a bright veil at the top of the image (backscatter), the
+                            #   mask no longer floods: reliability_study.py 'background' x4: 10% -> see README for the measured value after.
+                            #   false -> the old behaviour. The cost: a dim light in murky water loses the same brightness as the water.
+  bg_ref_v: 110.0           # Brightness (0-255) of the water below which nothing is subtracted. 110 = 2.7x the default synthetic water (V=41): MEASURED on the 400-frame tuning set GOOD 86.2% (ref 50) -> 91.5% (110), and in the reliability study background x4 stays at 95% good, x5 55%. UP -> subtracts only in very murky water; DOWN -> starts earlier and eats dim side lights.
+                            #   some noise. UP -> tolerates a brighter dark level without touching the image; DOWN -> starts subtracting earlier.
+  bg_row_pct: 10.0          # Which percentile of a row's brightness is taken as 'the water' (a row is never mostly light, so a low percentile ignores the lights).
   max_blobs: 4              # Max cores returned. Dock has 4 lights -> keep 4. Above 4 lets
                             #   reflections through and breaks T/B/L/R labelling; below 4 makes
                             #   geometry always invalid.
@@ -68,18 +119,18 @@ peaks:
   peak_mode: true           # true = local-peak cores (works when lights are close and bloom merges).
                             #   false = blob centroids (fast, but 4 merged lights become 1 core).
                             #   Keep true unless lights are always far apart and separate.
-  peak_sep: 28              # Min pixel distance between two cores (NMS radius; forced odd, >=5).
+  peak_sep: 25              # [TUNED 2026-10-10, was 28]  Min pixel distance between two cores (NMS radius; forced odd, >=5).
                             #   Set to ~0.5-0.8x the smallest expected light-to-light spacing.
                             #   TOO HIGH -> two real lights get merged into one (cores<4).
                             #   TOO LOW  -> one big light gives 2+ cores (duplicates, cores>4).
                             #   +/-10 px is considerable; at 28 lights closer than 28 px cannot be
                             #   separated (dock further than ~6-8 m may need ~12-16).
-  core_pct: 92              # Percentile (80-99) of brightness inside the bloom that forms the "tight
+  core_pct: 82              # [TUNED 2026-10-10, was 92]  Percentile (80-99) of brightness inside the bloom that forms the "tight
                             #   core" mask. UP -> tighter cores, better splitting of merged lights,
                             #   but weak lights may drop out. DOWN -> fatter cores, lights merge.
                             #   +/-5 points changes core-mask area by roughly 30-50%.
                             #   Values below 80 are clamped to 80 by the code.
-  tight_floor: 200.0        # Absolute brightness floor (0-255) for the tight core mask, applied even
+  tight_floor: 140.6        # [TUNED 2026-10-10, was 200.0]  Absolute brightness floor (0-255) for the tight core mask, applied even
                             #   if the percentile is lower. UP -> dim frames give no cores;
                             #   DOWN -> in dark frames the "core" becomes the whole glow.
                             #   +/-20 flips behaviour on murky scenes; irrelevant when bloom is saturated.
@@ -90,11 +141,11 @@ peaks:
   search_dilate_k: 9        # Bloom mask is grown by this many px before peak search so edge peaks
                             #   survive. +/-6 px extends the search zone by ~3 px per side; too big
                             #   lets neighbouring reflections compete for a core slot.
-  dog_sigma_small: 1.2      # Gaussian sigma (px) of the fine blur in Difference-of-Gaussians.
+  dog_sigma_small: 2.34      # [TUNED 2026-10-10, was 1.2]  Gaussian sigma (px) of the fine blur in Difference-of-Gaussians.
                             #   Should be about light-core radius/2. UP -> smoother, less noise,
                             #   less sharp peaks; DOWN -> peaks jitter with JPEG noise (+/-0.5 px
                             #   changes localisation noise by roughly +/-0.3 px).
-  dog_sigma_large: 4.0      # Gaussian sigma (px) of the coarse blur. Sets the size of blob DoG
+  dog_sigma_large: 15.0      # [TUNED 2026-10-10, was 4.0]  Gaussian sigma (px) of the coarse blur. Sets the size of blob DoG
                             #   responds to (~2-3x sigma = light radius). Use >= 2.5x sigma_small.
                             #   UP -> prefers larger lights (near dock), ignores small distant ones;
                             #   DOWN -> prefers tiny spots. +/-2 px shifts preferred light radius
@@ -103,16 +154,33 @@ peaks:
                             #   (fewer false cores, may lose a dim light); DOWN -> more candidates.
                             #   0.05 -> 0.15 typically removes ~half the weakest false peaks;
                             #   above ~0.4 real lights start to drop.
-  peak_abs_v_floor: 160.0   # A peak pixel must be at least this bright (0-255) regardless of the
+  peak_abs_v_floor: 80.0   # [TUNED 2026-10-10, was 160.0]  A peak pixel must be at least this bright (0-255) regardless of the
                             #   percentile. +/-20 is considerable: kills murky reflections (up) or
                             #   allows dim lights (down).
-  peak_abs_v_frac: 0.7      # A peak must also be >= this fraction of the tight core threshold
+  peak_abs_v_frac: 0.525      # [TUNED 2026-10-10, was 0.7]  A peak must also be >= this fraction of the tight core threshold
                             #   (~0.7*200 = 140 minimum). +/-0.1 moves the minimum by ~20 grey levels.
+  plateau_min_px: 12        # [NEW 2026-10-11] A light brighter than the sensor range clips to a flat top, and the DoG peak then lands anywhere on it. If the connected
+                            #   region within 2 grey levels of the peak has at least this many pixels, the core is its centroid. MEASURED (reliability_study.py, 4-12 m):
+                            #   pixel error 0.40 -> 0.11-0.23 px; murky water x3: 22% good -> 100%, x4: 0% -> 97.5%. 0 = off (the old behaviour: response-weighted centre).
+                            #   UP -> only big plateaus (close lights) use it; DOWN -> also tiny ones (the centroid of a 5-pixel plateau is as noisy as the peak).
   refine_half_window: 2     # Half size (px) of the sub-pixel centroid window (2 -> 5x5).
                             #   UP -> smoother centres but biased toward brighter neighbours
                             #   (up to ~1 px bias per +1); 0-1 is jittery. Considerable at >= 4.
   fallback_dist_min: 1.0    # Used only if DoG/response finds nothing: min distance-transform value
                             #   (px, ~light radius) for a fallback peak. UP -> ignores tiny specks.
+
+# ---------------------------------------------------------------------------
+# 2b) RING CHECK  (which bright spots are the dock?)   [NEW 2026-10-11]
+# ---------------------------------------------------------------------------
+ring:
+  enabled: true             # true: the peak finder hands over up to `candidates` bright spots and dock_ring.select_ring keeps the 4 that FORM the dock ring (an affine
+                            #   image of the 1 m circle: top/bottom on a diameter, the two side lights above the centre). A bubble, glint, reflection or false light
+                            #   then cannot take the place of a real light. false -> the old rule 'the 4 strongest peaks are the dock'.
+                            #   MEASURED (reliability_study.py): one false bright light per frame made 87% of frames BAD LOCK with the old rule.
+  fit_tol: 0.08             # Largest accepted leftover of the ring fit, as a fraction of the half top-bottom distance. A true ring measures 0.01 (far) to 0.06 (2.5 m,
+                            #   strongly oblique) without noise. UP -> accepts rings with more noise/perspective but lets a near-miss imposter through; DOWN -> stricter
+                            #   (valid frames drop at close range before bad locks drop). 0.05-0.12 is the useful range.
+  candidates: 8             # Bright spots examined (70 four-way combinations for 8). More = copes with more false lights but is slower and easier to fool.
 
 # ---------------------------------------------------------------------------
 # 3) ALIGNMENT DECISION  (dock_align message + on-screen "ALIGN OK")

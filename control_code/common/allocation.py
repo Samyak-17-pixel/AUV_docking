@@ -52,6 +52,7 @@ class Allocator:
         u_fin_off: float = 0.15,
         u_fin_full: float = 0.5,
         pitch_fin_share: float = 0.0,
+        small_force_n: float = 0.0,
     ) -> None:
         g = geom or load_geometry()
         self.g = g
@@ -90,6 +91,7 @@ class Allocator:
 
         self.u_fin_min, self.u_fin_off, self.u_fin_full = float(u_fin_min), float(u_fin_off), float(u_fin_full)
         self.pitch_fin_share = float(np.clip(pitch_fin_share, 0.0, 1.0))
+        self.small_force_n = max(0.0, float(small_force_n))   # below this force the RPM is LINEAR in the force (see force_to_rpm); 0 = pure square-root inversion
 
     # ---------------------------------------------------------------- thrusters
     def thrust_n(self, name: str, rpm: float) -> float:
@@ -98,10 +100,20 @@ class Allocator:
         return math.copysign(k * self.rho * d ** 4 * (abs(rpm) * self.rpm_to_rps) ** 2, rpm)
 
     def force_to_rpm(self, name: str, force_n: float) -> float:
+        """Thrust [N] -> RPM. Thrust ~ RPM^2, so the exact inverse is a square root, whose slope is INFINITE at zero: a +-0.5 N wobble in the demand
+        (sensor noise times a gain) becomes a +-370 RPM flip of the propeller. With small_force_n > 0 the map is a straight line through zero below that force
+        (matching value and slope at the joint), so tiny demands give tiny RPM. The price: for |F| < small_force_n the thruster delivers less than asked
+        (F^2 / small_force_n); the feedback loops simply see a softer gain there."""
         d = float(self._th[name]["D"])
         k = self.kt["fwd"] if force_n >= 0 else self.kt["rev"]
-        n_rps = math.sqrt(abs(force_n) / (k * self.rho * d ** 4))
-        rpm = math.copysign(n_rps / self.rpm_to_rps, force_n)
+        kk = k * self.rho * d ** 4
+        f = abs(force_n)
+        f0 = self.small_force_n
+        if f0 > 0.0 and f < f0:
+            rpm_mag = (math.sqrt(f0 / kk) / self.rpm_to_rps) * (f / f0)
+        else:
+            rpm_mag = math.sqrt(f / kk) / self.rpm_to_rps
+        rpm = math.copysign(rpm_mag, force_n)
         cap = min(self.rpm_cap, float(self._th[name]["n_max"]))
         return float(np.clip(rpm, -cap, cap))
 
@@ -129,7 +141,8 @@ class Allocator:
         m = np.array([K, self.pitch_fin_share * M, N], dtype=float)
         u_eff = max(abs(u), self.u_fin_min)
         lift = self.B_fin_pinv @ m                               # N of lift per fin
-        delta_rad = lift / (self.fin_k * u_eff ** 2)
+        sgn = -1.0 if u < 0.0 else 1.0                           # reverse flow reverses the lift of the same deflection (force ~ u*|u|)
+        delta_rad = lift / (self.fin_k * u_eff ** 2 * sgn)
         delta_deg = np.degrees(delta_rad) * self.fin_authority(u)
         cap = min(self.fin_cap_deg, self.fin_delta_max)
         delta_deg = np.clip(delta_deg, -cap, cap)

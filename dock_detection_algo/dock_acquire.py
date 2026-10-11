@@ -42,7 +42,7 @@ class PartialAcquire:
         nod_period_s: float = 8.0,
         backup_radius_frac: float = 0.22,
         backup_after_s: float = 8.0,
-        hfov_deg: float = 60.0,
+        vfov_deg: float = 60.0,
         flow_surge_norm: float = 0.35,
     ) -> None:
         self.edge_frac = float(edge_frac)
@@ -51,7 +51,7 @@ class PartialAcquire:
         self.nod_period_s = max(float(nod_period_s), 0.5)
         self.backup_radius_frac = float(backup_radius_frac)
         self.backup_after_s = float(backup_after_s)
-        self.hfov_deg = float(hfov_deg)
+        self.vfov_deg = float(vfov_deg)
         self.flow_surge_norm = float(flow_surge_norm)
         self._interior_since: Optional[float] = None
 
@@ -125,9 +125,11 @@ class PartialAcquire:
                 status="backup_close",
             )
 
-        half_hfov = max(self.hfov_deg * 0.5, 1.0)
-        vfov_deg = math.degrees(2.0 * math.atan(math.tan(math.radians(half_hfov)) * (height / float(width))))
-        half_vfov = max(vfov_deg * 0.5, 1.0)
+        # The sim's camera fov is the VERTICAL one; the horizontal half-angle follows from the aspect ratio.
+        half_vfov = max(self.vfov_deg * 0.5, 1.0)
+        half_hfov = max(
+            math.degrees(math.atan(math.tan(math.radians(half_vfov)) * (width / float(height)))), 1.0
+        )
         phase = 2.0 * math.pi * t_s / self.nod_period_s
         nod = math.sin(phase) * (self.nod_pitch_deg / half_vfov)
         wiggle = math.sin(phase + 0.5 * math.pi) * (self.yaw_wiggle_deg / half_hfov)

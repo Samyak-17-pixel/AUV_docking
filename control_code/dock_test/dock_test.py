@@ -47,6 +47,8 @@ def main(argv: Optional[list] = None) -> None:
 
     import rclpy
     from interfaces.msg import Actuator, DockAlign
+    from std_msgs.msg import String
+    import json
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
 
@@ -71,6 +73,8 @@ def main(argv: Optional[list] = None) -> None:
             self._since_status = 0.0
             self.tripped: Optional[str] = None
             self.pub = self.create_publisher(Actuator, cfg["topics"]["actuator_cmd"], 10)
+            self.dbg_pub = self.create_publisher(String, f"/{cfg['node'].get('vessel', 'Mako_01')}/ctrl_debug", 10)   # mode and distance for the viewer
+            self._dbg_t = 0.0
             self.create_subscription(Odometry, cfg["topics"]["odometry"], self._on_odom, 10)
             self.create_subscription(DockAlign, cfg["topics"]["dock_align"], self._on_dock, 10)
             self.create_timer(self.dt, self._tick)
@@ -143,8 +147,15 @@ def main(argv: Optional[list] = None) -> None:
                 roll_rate=float(self.st.nu[3]),
                 pitch_rate=float(self.st.nu[4]),
                 yaw_rate=float(self.st.nu[5]),
+                heave_rate=float(self.st.vel_ned()[2]),
+                dt=self.dt,
             )
             wrench, status = self.core.update(view, snap)
+            self._dbg_t += self.dt
+            if self._dbg_t >= 0.5:
+                self._dbg_t = 0.0
+                d = status.get("d_m", float("nan"))
+                self.dbg_pub.publish(String(data=json.dumps({"ctrl": "dock_test", "mode": status["mode"], "distance_m": None if d != d else float(d)})))
             out = self.alloc.allocate(wrench, snap.speed_u)
             self.publish(out)
             self._since_status += self.dt
